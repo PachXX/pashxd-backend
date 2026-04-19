@@ -21,3 +21,7 @@ services:
         value: https://pashx.com
       - key: ADMIN_URL
         value: https://admin.pashx.com
+
+      # ✅ ADD THIS
+      - key: PYTHON_VERSION
+        value: 3.11.9

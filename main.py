@@ -100,6 +100,7 @@ ALLOWED_ORIGINS = [
     "https://pashx.com",
     "https://www.pashx.com",
     "https://admin.pashx.com",
+    "https://pashxd.vercel.app",
 ]
 
 app.add_middleware(
