@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
 import uuid
 from datetime import datetime, timezone
+import json
 
 # Import new admin routes
 from app.routes.auth import router as auth_router
@@ -18,6 +19,9 @@ from app.routes.crm import router as crm_router
 from app.routes.seo import router as seo_router
 from app.routes.dashboard import sitemap_router, dashboard_router
 from app.utils.hash import hash_password
+
+# Import insights router (KEEP THIS ONLY ONCE)
+from app.api.routes.insights import router as insights_router
 
 # ─── SETUP ────────────────────────────────────────────────
 
@@ -90,9 +94,9 @@ app = FastAPI(
 # ─── CORS ─────────────────────────────────────────────────
 
 ALLOWED_ORIGINS = [
-    "http://localhost:5173",   # Vite dev
-    "http://localhost:5174",   # ADD THIS LINE
-    "http://localhost:3000",   # Admin dev
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
     "https://pashx.com",
     "https://www.pashx.com",
     "https://admin.pashx.com",
@@ -201,6 +205,7 @@ app.include_router(crm_router)
 app.include_router(seo_router)
 app.include_router(sitemap_router)
 app.include_router(dashboard_router)
+app.include_router(insights_router)  # ← MOVED HERE, ONLY ONCE
 
 
 @app.get("/health")

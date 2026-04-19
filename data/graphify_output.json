@@ -1,0 +1,22 @@
+[
+  {
+    "title": "High dependency detected",
+    "description": "The CRM module has multiple dependencies affecting performance.",
+    "type": "warning",
+    "icon": "AlertTriangle",
+    "action": "Review module"
+  },
+  {
+    "title": "Fast response time",
+    "description": "Dashboard API is performing optimally.",
+    "type": "success",
+    "icon": "TrendingUp"
+  },
+  {
+    "title": "Optimization available",
+    "description": "You can reduce load time by optimizing asset imports.",
+    "type": "info",
+    "icon": "Zap",
+    "action": "Optimize now"
+  }
+]
