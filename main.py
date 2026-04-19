@@ -91,6 +91,7 @@ app = FastAPI(
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",   # Vite dev
+    "http://localhost:5174",   # ADD THIS LINE
     "http://localhost:3000",   # Admin dev
     "https://pashx.com",
     "https://www.pashx.com",
