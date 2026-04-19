@@ -92,7 +92,11 @@ app = FastAPI(
 
 
 # ─── CORS ─────────────────────────────────────────────────
+# ─── CORS ─────────────────────────────────────────────────
 
+from fastapi.middleware.cors import CORSMiddleware
+
+# Base allowed origins
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:5174",
@@ -100,18 +104,27 @@ ALLOWED_ORIGINS = [
     "https://pashx.com",
     "https://www.pashx.com",
     "https://admin.pashx.com",
-    "https://pashxd.vercel.app",
 ]
+
+# Safely include env-based URLs (prevents crash)
+frontend_url = os.getenv("FRONTEND_URL")
+admin_url = os.getenv("ADMIN_URL")
+
+for url in [frontend_url, admin_url]:
+    if url and isinstance(url, str) and url.startswith("http"):
+        ALLOWED_ORIGINS.append(url)
+
+# Remove duplicates safely
+ALLOWED_ORIGINS = list(set(ALLOWED_ORIGINS))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",  # ✅ supports all Vercel deployments
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 # ─── EXISTING ROUTES (YOUR ORIGINAL CODE) ────────────────
 
 api_router = APIRouter(prefix="/api")
