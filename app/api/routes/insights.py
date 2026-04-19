@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from app.services.graphify_service import run_graphify, parse_graphify_output
 from app.services.insights_service import InsightsService
-
 router = APIRouter(prefix="/api/insights", tags=["insights"])
 insights_service = InsightsService()
 
