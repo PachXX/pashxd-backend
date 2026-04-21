@@ -7,140 +7,132 @@ from pathlib import Path
 import os
 import logging
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import Optional
 import uuid
 from datetime import datetime, timezone
-import json
 
-# Import new admin routes
-from app.routes.auth import router as auth_router
-from app.routes.blog import router as blog_router
-from app.routes.crm import router as crm_router
-from app.routes.seo import router as seo_router
-from app.routes.dashboard import sitemap_router, dashboard_router
-from app.utils.hash import hash_password
+# ✅ CRM FUNCTIONS
+from app.services.crm_bridge import create_or_update_contact, create_deal_if_not_exists
 
-# Import insights router (KEEP THIS ONLY ONCE)
-from app.api.routes.insights import router as insights_router
+# ─── SAFE IMPORT HELPER (prevents app crash) ──────────────
+def safe_import_router(import_path, name="router"):
+    try:
+        module = __import__(import_path, fromlist=[name])
+        return getattr(module, name)
+    except Exception as e:
+        print(f"❌ Failed to import {import_path}: {e}")
+        return None
 
-# ─── SETUP ────────────────────────────────────────────────
+# ─── LOAD ENV ─────────────────────────────────────────────
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db_name = os.environ.get('DB_NAME', 'pashxd')
-db_instance = client[db_name]
+# ─── LOGGING ──────────────────────────────────────────────
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ─── DATABASE ─────────────────────────────────────────────
+
+mongo_url = os.getenv("MONGO_URL")
+if not mongo_url:
+    raise ValueError("❌ MONGO_URL not set")
+
+client = AsyncIOMotorClient(mongo_url)
+db_name = os.getenv("DB_NAME", "pashxd")
+db_instance = client[db_name]
 
 # ─── LIFESPAN ─────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    from app.config import database
-    database.db = db_instance
-    logger.info(f"✅ Connected to MongoDB: {db_name}")
+    try:
+        from app.config import database
+        database.db = db_instance
+        logger.info(f"✅ Connected to MongoDB: {db_name}")
+    except Exception as e:
+        logger.error(f"❌ DB setup failed: {e}")
 
-    # Seed admin user
     await seed_admin()
-
     yield
 
-    # Shutdown
     client.close()
-    logger.info("❌ MongoDB connection closed")
-
+    logger.info("❌ MongoDB closed")
 
 async def seed_admin():
-    """Create default admin user if none exists"""
-    admin_email = os.getenv("ADMIN_EMAIL", "admin@pashx.com")
-    admin_password = os.getenv("ADMIN_PASSWORD", "changeme123")
+    try:
+        from app.utils.hash import hash_password
+        admin_email = os.getenv("ADMIN_EMAIL", "admin@pashx.com")
+        admin_password = os.getenv("ADMIN_PASSWORD", "changeme123")
 
-    existing = await db_instance.users.find_one({"email": admin_email})
-    if not existing:
-        await db_instance.users.insert_one({
-            "email": admin_email,
-            "password": hash_password(admin_password),
-            "role": "admin",
-            "created_at": datetime.utcnow(),
-        })
-        logger.info(f"✅ Admin user created: {admin_email}")
-    else:
-        logger.info(f"ℹ️  Admin user already exists: {admin_email}")
+        existing = await db_instance.users.find_one({"email": admin_email})
+        if not existing:
+            await db_instance.users.insert_one({
+                "email": admin_email,
+                "password": hash_password(admin_password),
+                "role": "admin",
+                "created_at": datetime.utcnow(),
+            })
+            logger.info(f"✅ Admin created: {admin_email}")
+        else:
+            logger.info("ℹ️ Admin exists")
+    except Exception as e:
+        logger.error(f"❌ Admin seed failed: {e}")
 
-
-# ─── APP SETUP ────────────────────────────────────────────
+# ─── APP ─────────────────────────────────────────────────
 
 app = FastAPI(
     title="PashxD API",
-    description="AI-Powered Industrial OS & Construction ERP — Backend API",
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/docs",
-    redoc_url="/redoc",
 )
 
+# ─── CORS ────────────────────────────────────────────────
 
-# ─── CORS ─────────────────────────────────────────────────
-# ─── CORS ─────────────────────────────────────────────────
+def get_allowed_origins():
+    origins = [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+    ]
 
-from fastapi.middleware.cors import CORSMiddleware
+    cors_env = os.getenv("CORS_ORIGINS")
+    if cors_env:
+        origins.extend([o.strip() for o in cors_env.split(",") if o.strip()])
 
-# Base allowed origins
-ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://localhost:3000",
-    "https://pashx.com",
-    "https://www.pashx.com",
-    "https://admin.pashx.com",
-]
+    for key in ["FRONTEND_URL", "ADMIN_URL"]:
+        val = os.getenv(key)
+        if val and val.startswith("http"):
+            origins.append(val)
 
-# Safely include env-based URLs (prevents crash)
-frontend_url = os.getenv("FRONTEND_URL")
-admin_url = os.getenv("ADMIN_URL")
-
-for url in [frontend_url, admin_url]:
-    if url and isinstance(url, str) and url.startswith("http"):
-        ALLOWED_ORIGINS.append(url)
-
-# Remove duplicates safely
-ALLOWED_ORIGINS = list(set(ALLOWED_ORIGINS))
+    return list(set(origins))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app",  # ✅ supports all Vercel deployments
+    allow_origins=get_allowed_origins(),
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ─── EXISTING ROUTES (YOUR ORIGINAL CODE) ────────────────
+
+# ─── API ROUTER ──────────────────────────────────────────
 
 api_router = APIRouter(prefix="/api")
 
+# ─── MODELS ──────────────────────────────────────────────
 
-# Define Models
 class StatusCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     client_name: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-
 class StatusCheckCreate(BaseModel):
     client_name: str
-
 
 class DemoRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -153,7 +145,6 @@ class DemoRequest(BaseModel):
     message: Optional[str] = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-
 class DemoRequestCreate(BaseModel):
     name: str
     email: str
@@ -162,65 +153,68 @@ class DemoRequestCreate(BaseModel):
     industry: Optional[str] = ""
     message: Optional[str] = ""
 
+# ─── BASIC ROUTES ────────────────────────────────────────
 
-# Routes
 @api_router.get("/")
 async def root():
-    return {"message": "PashxD API", "version": "1.0.0"}
+    return {"message": "PashxD API running"}
 
+@api_router.get("/status")
+async def get_status():
+    return {"status": "ok"}
 
 @api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    _ = await db_instance.status_checks.insert_one(doc)
-    return status_obj
+async def create_status(input: StatusCheckCreate):
+    obj = StatusCheck(**input.model_dump())
+    doc = obj.model_dump()
+    doc["timestamp"] = doc["timestamp"].isoformat()
+    await db_instance.status_checks.insert_one(doc)
+    return obj
 
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db_instance.status_checks.find({}, {"_id": 0}).to_list(1000)
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    return status_checks
-
+# ─── DEMO → CRM ──────────────────────────────────────────
 
 @api_router.post("/demo-requests", response_model=DemoRequest)
-async def create_demo_request(input: DemoRequestCreate):
+async def create_demo(input: DemoRequestCreate):
     demo_dict = input.model_dump()
     demo_obj = DemoRequest(**demo_dict)
+
     doc = demo_obj.model_dump()
-    doc['created_at'] = doc['created_at'].isoformat()
-    _ = await db_instance.demo_requests.insert_one(doc)
+    doc["created_at"] = doc["created_at"].isoformat()
+
+    await db_instance.demo_requests.insert_one(doc)
+
+    contact = await create_or_update_contact(db_instance, doc)
+    await create_deal_if_not_exists(db_instance, contact, doc)
+
     return demo_obj
 
-
-@api_router.get("/demo-requests", response_model=List[DemoRequest])
+@api_router.get("/demo-requests")
 async def get_demo_requests():
     requests = await db_instance.demo_requests.find({}, {"_id": 0}).to_list(1000)
+
     for req in requests:
-        if isinstance(req.get('created_at'), str):
-            req['created_at'] = datetime.fromisoformat(req['created_at'])
+        if isinstance(req.get("created_at"), str):
+            req["created_at"] = datetime.fromisoformat(req["created_at"])
+
     return requests
 
-
-# Include existing API router
 app.include_router(api_router)
 
+# ─── SAFE ROUTE REGISTRATION ─────────────────────────────
 
-# ─── NEW ADMIN ROUTES ─────────────────────────────────────
+for route_path in [
+    "app.routes.auth",
+    "app.routes.blog",
+    "app.routes.crm",
+    "app.routes.seo",
+    "app.routes.dashboard",
+    "app.api.routes.insights",
+]:
+    router = safe_import_router(route_path)
+    if router:
+        app.include_router(router)
 
-app.include_router(auth_router)
-app.include_router(blog_router)
-app.include_router(crm_router)
-app.include_router(seo_router)
-app.include_router(sitemap_router)
-app.include_router(dashboard_router)
-app.include_router(insights_router)  # ← MOVED HERE, ONLY ONCE
-
+# ─── HEALTH ──────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
