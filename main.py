@@ -11,19 +11,7 @@ from typing import Optional
 import uuid
 from datetime import datetime, timezone
 
-# ✅ CRM FUNCTIONS
-from app.services.crm_bridge import create_or_update_contact, create_deal_if_not_exists
-
-# ─── SAFE IMPORT HELPER (prevents app crash) ──────────────
-def safe_import_router(import_path, name="router"):
-    try:
-        module = __import__(import_path, fromlist=[name])
-        return getattr(module, name)
-    except Exception as e:
-        print(f"❌ Failed to import {import_path}: {e}")
-        return None
-
-# ─── LOAD ENV ─────────────────────────────────────────────
+# ─── LOAD ENV FIRST ──────────────────────────────────────
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -37,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 mongo_url = os.getenv("MONGO_URL")
 if not mongo_url:
-    raise ValueError("❌ MONGO_URL not set")
+    logger.warning("⚠️ MONGO_URL not set, using default")
+    mongo_url = "mongodb://localhost:27017"
 
 client = AsyncIOMotorClient(mongo_url)
 db_name = os.getenv("DB_NAME", "pashxd")
@@ -47,38 +36,46 @@ db_instance = client[db_name]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """App startup and shutdown"""
     try:
         from app.config import database
         database.db = db_instance
         logger.info(f"✅ Connected to MongoDB: {db_name}")
     except Exception as e:
-        logger.error(f"❌ DB setup failed: {e}")
+        logger.warning(f"⚠️ DB config setup skipped: {e}")
 
-    await seed_admin()
+    # Try to seed admin
+    try:
+        await seed_admin()
+    except Exception as e:
+        logger.warning(f"⚠️ Admin seed skipped: {e}")
+
     yield
 
-    client.close()
-    logger.info("❌ MongoDB closed")
+    try:
+        client.close()
+        logger.info("🔴 MongoDB closed")
+    except Exception:
+        pass
 
 async def seed_admin():
-    try:
-        from app.utils.hash import hash_password
-        admin_email = os.getenv("ADMIN_EMAIL", "admin@pashx.com")
-        admin_password = os.getenv("ADMIN_PASSWORD", "changeme123")
+    """Create default admin user if not exists"""
+    from app.utils.hash import hash_password
 
-        existing = await db_instance.users.find_one({"email": admin_email})
-        if not existing:
-            await db_instance.users.insert_one({
-                "email": admin_email,
-                "password": hash_password(admin_password),
-                "role": "admin",
-                "created_at": datetime.utcnow(),
-            })
-            logger.info(f"✅ Admin created: {admin_email}")
-        else:
-            logger.info("ℹ️ Admin exists")
-    except Exception as e:
-        logger.error(f"❌ Admin seed failed: {e}")
+    admin_email = os.getenv("ADMIN_EMAIL", "admin@pashx.com")
+    admin_password = os.getenv("ADMIN_PASSWORD", "changeme123")
+
+    existing = await db_instance.users.find_one({"email": admin_email})
+    if not existing:
+        await db_instance.users.insert_one({
+            "email": admin_email,
+            "password": hash_password(admin_password),
+            "role": "admin",
+            "created_at": datetime.utcnow(),
+        })
+        logger.info(f"✅ Admin created: {admin_email}")
+    else:
+        logger.info("ℹ️ Admin exists")
 
 # ─── APP ─────────────────────────────────────────────────
 
@@ -92,6 +89,7 @@ app = FastAPI(
 # ─── CORS ────────────────────────────────────────────────
 
 def get_allowed_origins():
+    """Build list of allowed CORS origins"""
     origins = [
         "http://localhost:5173",
         "http://localhost:5174",
@@ -118,10 +116,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ─── API ROUTER ──────────────────────────────────────────
-
-api_router = APIRouter(prefix="/api")
 
 # ─── MODELS ──────────────────────────────────────────────
 
@@ -153,6 +147,10 @@ class DemoRequestCreate(BaseModel):
     industry: Optional[str] = ""
     message: Optional[str] = ""
 
+# ─── API ROUTER ──────────────────────────────────────────
+
+api_router = APIRouter(prefix="/api")
+
 # ─── BASIC ROUTES ────────────────────────────────────────
 
 @api_router.get("/")
@@ -171,10 +169,11 @@ async def create_status(input: StatusCheckCreate):
     await db_instance.status_checks.insert_one(doc)
     return obj
 
-# ─── DEMO → CRM ──────────────────────────────────────────
+# ─── DEMO REQUESTS ───────────────────────────────────────
 
 @api_router.post("/demo-requests", response_model=DemoRequest)
 async def create_demo(input: DemoRequestCreate):
+    """Create demo request and optionally sync to CRM"""
     demo_dict = input.model_dump()
     demo_obj = DemoRequest(**demo_dict)
 
@@ -183,13 +182,20 @@ async def create_demo(input: DemoRequestCreate):
 
     await db_instance.demo_requests.insert_one(doc)
 
-    contact = await create_or_update_contact(db_instance, doc)
-    await create_deal_if_not_exists(db_instance, contact, doc)
+    # Try CRM sync but don't fail if it doesn't work
+    try:
+        from app.services.crm_bridge import create_or_update_contact, create_deal_if_not_exists
+        contact = await create_or_update_contact(db_instance, doc)
+        await create_deal_if_not_exists(db_instance, contact, doc)
+        logger.info("✅ Demo synced to CRM")
+    except Exception as e:
+        logger.warning(f"⚠️ CRM sync failed: {e}")
 
     return demo_obj
 
 @api_router.get("/demo-requests")
 async def get_demo_requests():
+    """Get all demo requests"""
     requests = await db_instance.demo_requests.find({}, {"_id": 0}).to_list(1000)
 
     for req in requests:
@@ -198,24 +204,55 @@ async def get_demo_requests():
 
     return requests
 
+# Include main API router
 app.include_router(api_router)
 
-# ─── SAFE ROUTE REGISTRATION ─────────────────────────────
+# ─── SAFE ROUTE IMPORT ───────────────────────────────────
 
-for route_path in [
+def safe_import_router(import_path, name="router"):
+    """Safely import a router without crashing the app"""
+    try:
+        module = __import__(import_path, fromlist=[name])
+        router = getattr(module, name, None)
+        if router is None:
+            logger.error(f"❌ {import_path} has no '{name}' attribute")
+            return None
+        logger.info(f"✅ Loaded {import_path}")
+        return router
+    except ImportError as e:
+        logger.error(f"❌ Cannot import {import_path}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error loading {import_path}: {e}")
+        return None
+
+# ─── LOAD APP ROUTES ─────────────────────────────────────
+
+route_modules = [
     "app.routes.auth",
     "app.routes.blog",
     "app.routes.crm",
     "app.routes.seo",
     "app.routes.dashboard",
-    "app.api.routes.insights",
-]:
+]
+
+for route_path in route_modules:
     router = safe_import_router(route_path)
     if router:
         app.include_router(router)
 
-# ─── HEALTH ──────────────────────────────────────────────
+# Try insights route (may be in different locations)
+for insights_path in ["app.api.routes.insights", "app.routes.insights"]:
+    router = safe_import_router(insights_path)
+    if router:
+        app.include_router(router)
+        break
+
+# ─── HEALTH CHECK ────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "pashxd-api"}
+
+logger.info("🚀 Application initialized")

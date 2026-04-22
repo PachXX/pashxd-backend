@@ -3,13 +3,16 @@ from fastapi.responses import Response
 from app.middleware.auth import require_admin
 from app.config.database import get_db
 from datetime import datetime
+from bson import ObjectId
 
-sitemap_router = APIRouter(tags=["Sitemap"])
-dashboard_router = APIRouter(prefix="/api/dashboard", tags=["Dashboard"])
+# Single router that exports as "router" for main.py to import
+router = APIRouter()
 
+# ─── SITEMAP ──────────────────────────────────────────────
 
-@sitemap_router.get("/sitemap.xml", include_in_schema=False)
+@router.get("/sitemap.xml", include_in_schema=False, tags=["Sitemap"])
 async def generate_sitemap():
+    """Generate XML sitemap for SEO"""
     db = get_db()
     blogs = await db.blogs.find(
         {"status": "published"},
@@ -51,10 +54,11 @@ async def generate_sitemap():
     return Response(content=sitemap, media_type="application/xml")
 
 
-# ── DASHBOARD ─────────────────────────────────────────────
+# ─── DASHBOARD ────────────────────────────────────────────
 
-@dashboard_router.get("/stats")
+@router.get("/api/dashboard/stats", tags=["Dashboard"])
 async def get_dashboard_stats(user=Depends(require_admin)):
+    """Get dashboard statistics for admin panel"""
     db = get_db()
 
     # Blog stats
@@ -78,8 +82,11 @@ async def get_dashboard_stats(user=Depends(require_admin)):
     # Recent activities
     recent = await db.activities.find({}).sort("created_at", -1).limit(5).to_list(length=5)
     for a in recent:
-        contact = await db.contacts.find_one({"_id": __import__('bson').ObjectId(a["contact_id"])}, {"name": 1})
-        a["contact_name"] = contact["name"] if contact else "Unknown"
+        try:
+            contact = await db.contacts.find_one({"_id": ObjectId(a["contact_id"])}, {"name": 1})
+            a["contact_name"] = contact["name"] if contact else "Unknown"
+        except Exception:
+            a["contact_name"] = "Unknown"
         a["id"] = str(a.pop("_id"))
 
     # Monthly contacts (last 6 months)
