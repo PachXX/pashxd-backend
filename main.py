@@ -85,38 +85,59 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs",
 )
+app = FastAPI(
+    title="PashxD API",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+)
+
+# ✅ ADD MIDDLEWARE HERE
+@app.middleware("http")
+async def add_process_time_header(request, call_next):
+    response = await call_next(request)
+    response.headers["X-App-Name"] = "PashxD"
+    return response
+
 
 # ─── CORS ────────────────────────────────────────────────
 
 def get_allowed_origins():
-    """Build list of allowed CORS origins"""
     origins = [
         "http://localhost:5173",
         "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
+        "https://pashx.com",
+        "https://www.pashx.com",
+        "https://admin.pashx.com",
+        "https://pashxd-admin.vercel.app"
     ]
 
+    # Add from ENV
     cors_env = os.getenv("CORS_ORIGINS")
     if cors_env:
         origins.extend([o.strip() for o in cors_env.split(",") if o.strip()])
 
-    for key in ["FRONTEND_URL", "ADMIN_URL"]:
-        val = os.getenv(key)
-        if val and val.startswith("http"):
-            origins.append(val)
+    # Add deployed frontend URLs
+    frontend_url = os.getenv("FRONTEND_URL")
+    admin_url = os.getenv("ADMIN_URL")
+
+    if frontend_url:
+        origins.append(frontend_url)
+
+    if admin_url:
+        origins.append(admin_url)
 
     return list(set(origins))
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"https://.*\.vercel\.app",  # ✅ allow ALL Vercel previews
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ─── MODELS ──────────────────────────────────────────────
 
 class StatusCheck(BaseModel):
