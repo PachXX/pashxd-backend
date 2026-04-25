@@ -1,238 +1,259 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
-from app.models.schemas import (
-    ContactCreate, ContactUpdate,
-    DealCreate, DealUpdate,
-    ActivityCreate
-)
-from app.middleware.auth import require_admin
-from app.config.database import get_db
-from bson import ObjectId
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, EmailStr
+from typing import Optional, Literal
 from datetime import datetime
+from bson import ObjectId
 
-router = APIRouter(prefix="/api/crm", tags=["CRM"])
+router = APIRouter(prefix="/api/crm", tags=["crm"])
 
+# ==================== MODELS ====================
 
-def fmt(doc: dict) -> dict:
-    doc["id"] = str(doc.pop("_id"))
-    return doc
+class ContactCreate(BaseModel):
+    name: str
+    email: EmailStr
+    phone: Optional[str] = ""
+    company: Optional[str] = ""
+    role: Optional[str] = ""
+    industry: Optional[str] = ""
+    source: str = "manual"
 
+class DealCreate(BaseModel):
+    title: str
+    contact_id: str
+    value: float = 0
+    currency: str = "EUR"
+    stage: Literal["lead", "qualified", "proposal", "negotiation", "won", "lost"] = "lead"
+    probability: int = 10
+    notes: Optional[str] = ""
+    source: str = "manual"
 
-# ── CONTACTS ──────────────────────────────────────────────
+class DealUpdate(BaseModel):
+    stage: Optional[str] = None
+    value: Optional[float] = None
+    notes: Optional[str] = None
+    probability: Optional[int] = None
+    title: Optional[str] = None
+
+# ==================== CONTACTS ====================
 
 @router.get("/contacts")
-async def list_contacts(
-        search: str = None,
-        status: str = None,
-        limit: int = Query(20, le=100),
-        skip: int = 0,
-        user=Depends(require_admin),
-):
-    db = get_db()
-    query = {}
-    if status:
-        query["status"] = status
-    if search:
-        query["$or"] = [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"email": {"$regex": search, "$options": "i"}},
-            {"company": {"$regex": search, "$options": "i"}},
-        ]
+async def get_contacts():
+    """Get all contacts"""
+    from app.config import database
 
-    cursor = db.contacts.find(query).sort("created_at", -1).skip(skip).limit(limit)
-    contacts = await cursor.to_list(length=limit)
-    total = await db.contacts.count_documents(query)
+    contacts = await database.db.contacts.find({}).to_list(1000)
 
     return {
-        "contacts": [fmt(c) for c in contacts],
-        "total": total,
+        "contacts": [
+            {
+                "id": str(c["_id"]),
+                "name": c.get("name", ""),
+                "email": c.get("email", ""),
+                "phone": c.get("phone", ""),
+                "company": c.get("company", ""),
+                "role": c.get("role", ""),
+                "industry": c.get("industry", ""),
+                "source": c.get("source", "manual"),
+                "created_at": c.get("created_at", datetime.utcnow()).isoformat(),
+            }
+            for c in contacts
+        ]
     }
 
-
-@router.get("/contacts/{id}")
-async def get_contact(id: str, user=Depends(require_admin)):
-    db = get_db()
-    doc = await db.contacts.find_one({"_id": ObjectId(id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Contact not found")
-
-    # Attach deals + activities
-    deals = await db.deals.find({"contact_id": id}).to_list(length=50)
-    activities = await db.activities.find({"contact_id": id}).sort("created_at", -1).to_list(length=50)
-
-    contact = fmt(doc)
-    contact["deals"] = [fmt(d) for d in deals]
-    contact["activities"] = [fmt(a) for a in activities]
-    return contact
-
-
 @router.post("/contacts")
-async def create_contact(body: ContactCreate, user=Depends(require_admin)):
-    db = get_db()
-    now = datetime.utcnow()
-    doc = {**body.model_dump(), "created_at": now, "updated_at": now}
-    result = await db.contacts.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return fmt(doc)
+async def create_contact(contact: ContactCreate):
+    """Create new contact"""
+    from app.config import database
 
+    # Check if email exists
+    existing = await database.db.contacts.find_one({"email": contact.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Contact with this email already exists")
 
-@router.put("/contacts/{id}")
-async def update_contact(id: str, body: ContactUpdate, user=Depends(require_admin)):
-    db = get_db()
-    update_data = {k: v for k, v in body.model_dump().items() if v is not None}
-    update_data["updated_at"] = datetime.utcnow()
+    contact_doc = {
+        **contact.dict(),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
 
-    result = await db.contacts.update_one({"_id": ObjectId(id)}, {"$set": update_data})
-    if result.matched_count == 0:
+    result = await database.db.contacts.insert_one(contact_doc)
+
+    return {
+        "id": str(result.inserted_id),
+        **contact.dict(),
+        "created_at": contact_doc["created_at"].isoformat(),
+    }
+
+@router.get("/contacts/{contact_id}")
+async def get_contact(contact_id: str):
+    """Get single contact"""
+    from app.config import database
+
+    contact = await database.db.contacts.find_one({"_id": ObjectId(contact_id)})
+    if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
 
-    doc = await db.contacts.find_one({"_id": ObjectId(id)})
-    return fmt(doc)
+    return {
+        "id": str(contact["_id"]),
+        "name": contact.get("name", ""),
+        "email": contact.get("email", ""),
+        "phone": contact.get("phone", ""),
+        "company": contact.get("company", ""),
+        "role": contact.get("role", ""),
+        "industry": contact.get("industry", ""),
+        "source": contact.get("source", "manual"),
+        "created_at": contact.get("created_at", datetime.utcnow()).isoformat(),
+    }
 
-
-@router.delete("/contacts/{id}")
-async def delete_contact(id: str, user=Depends(require_admin)):
-    db = get_db()
-    result = await db.contacts.delete_one({"_id": ObjectId(id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Contact not found")
-    # Clean up related deals + activities
-    await db.deals.delete_many({"contact_id": id})
-    await db.activities.delete_many({"contact_id": id})
-    return {"message": "Contact and related records deleted"}
-
-
-# ── DEALS / PIPELINE ──────────────────────────────────────
-
-@router.get("/deals")
-async def list_deals(
-        stage: str = None,
-        contact_id: str = None,
-        user=Depends(require_admin),
-):
-    db = get_db()
-    query = {}
-    if stage:
-        query["stage"] = stage
-    if contact_id:
-        query["contact_id"] = contact_id
-
-    deals = await db.deals.find(query).sort("created_at", -1).to_list(length=200)
-
-    # Attach contact name
-    for d in deals:
-        contact = await db.contacts.find_one(
-            {"_id": ObjectId(d["contact_id"])},
-            {"name": 1}
-        )
-        d["contact_name"] = contact["name"] if contact else "Unknown"
-
-    return {"deals": [fmt(d) for d in deals]}
-
+# ==================== DEALS/PIPELINE ====================
 
 @router.get("/pipeline")
-async def get_pipeline(user=Depends(require_admin)):
-    """Returns deals grouped by stage for kanban board"""
-    db = get_db()
-    stages = ["lead", "qualified", "proposal", "negotiation", "won", "lost"]
-    pipeline = {}
+async def get_pipeline():
+    """Get all deals organized by stage"""
+    from app.config import database
 
-    for stage in stages:
-        deals = await db.deals.find({"stage": stage}).sort("updated_at", -1).to_list(length=100)
-        for d in deals:
-            contact = await db.contacts.find_one(
-                {"_id": ObjectId(d["contact_id"])}, {"name": 1}
-            )
-            d["contact_name"] = contact["name"] if contact else "Unknown"
-        pipeline[stage] = [fmt(d) for d in deals]
+    deals = await database.db.deals.find({}).to_list(1000)
+
+    # Organize by stage
+    pipeline = {
+        "lead": [],
+        "qualified": [],
+        "proposal": [],
+        "negotiation": [],
+        "won": [],
+        "lost": [],
+    }
+
+    for deal in deals:
+        # Get contact info
+        contact = await database.db.contacts.find_one({"_id": ObjectId(deal["contact_id"])})
+
+        deal_data = {
+            "id": str(deal["_id"]),
+            "title": deal.get("title", ""),
+            "value": deal.get("value", 0),
+            "currency": deal.get("currency", "EUR"),
+            "stage": deal.get("stage", "lead"),
+            "probability": deal.get("probability", 10),
+            "notes": deal.get("notes", ""),
+            "source": deal.get("source", "manual"),
+            "created_at": deal.get("created_at", datetime.utcnow()).isoformat(),
+            "updated_at": deal.get("updated_at", datetime.utcnow()).isoformat(),
+            "contact": {
+                "id": str(contact["_id"]) if contact else "",
+                "name": contact.get("name", "") if contact else "",
+                "email": contact.get("email", "") if contact else "",
+                "company": contact.get("company", "") if contact else "",
+            }
+        }
+
+        stage = deal.get("stage", "lead")
+        if stage in pipeline:
+            pipeline[stage].append(deal_data)
 
     return pipeline
 
-
 @router.post("/deals")
-async def create_deal(body: DealCreate, user=Depends(require_admin)):
-    db = get_db()
+async def create_deal(deal: DealCreate):
+    """Create new deal"""
+    from app.config import database
+
     # Verify contact exists
-    contact = await db.contacts.find_one({"_id": ObjectId(body.contact_id)})
+    contact = await database.db.contacts.find_one({"_id": ObjectId(deal.contact_id)})
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
 
-    now = datetime.utcnow()
-    doc = {**body.model_dump(), "created_at": now, "updated_at": now}
-    result = await db.deals.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    doc["contact_name"] = contact["name"]
-    return fmt(doc)
+    deal_doc = {
+        **deal.dict(),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
 
+    result = await database.db.deals.insert_one(deal_doc)
 
-@router.put("/deals/{id}")
-async def update_deal(id: str, body: DealUpdate, user=Depends(require_admin)):
-    db = get_db()
-    update_data = {k: v for k, v in body.model_dump().items() if v is not None}
+    return {
+        "id": str(result.inserted_id),
+        **deal.dict(),
+        "contact_name": contact.get("name", ""),
+        "contact_email": contact.get("email", ""),
+        "company": contact.get("company", ""),
+        "created_at": deal_doc["created_at"].isoformat(),
+        "updated_at": deal_doc["updated_at"].isoformat(),
+    }
+
+@router.patch("/deals/{deal_id}")
+async def update_deal(deal_id: str, updates: DealUpdate):
+    """Update deal (stage, value, notes, etc.)"""
+    from app.config import database
+
+    # Validate ObjectId
+    try:
+        obj_id = ObjectId(deal_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid deal ID")
+
+    update_data = {k: v for k, v in updates.dict().items() if v is not None}
     update_data["updated_at"] = datetime.utcnow()
 
-    result = await db.deals.update_one({"_id": ObjectId(id)}, {"$set": update_data})
+    result = await database.db.deals.update_one(
+        {"_id": obj_id},
+        {"$set": update_data}
+    )
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Deal not found")
 
-    doc = await db.deals.find_one({"_id": ObjectId(id)})
-    contact = await db.contacts.find_one(
-        {"_id": ObjectId(doc["contact_id"])}, {"name": 1}
-    )
-    doc["contact_name"] = contact["name"] if contact else "Unknown"
-    return fmt(doc)
+    return {"success": True, "updated": update_data}
 
+@router.delete("/deals/{deal_id}")
+async def delete_deal(deal_id: str):
+    """Delete deal"""
+    from app.config import database
 
-@router.delete("/deals/{id}")
-async def delete_deal(id: str, user=Depends(require_admin)):
-    db = get_db()
-    result = await db.deals.delete_one({"_id": ObjectId(id)})
+    try:
+        obj_id = ObjectId(deal_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid deal ID")
+
+    result = await database.db.deals.delete_one({"_id": obj_id})
+
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Deal not found")
-    return {"message": "Deal deleted"}
 
+    return {"success": True}
 
-# ── ACTIVITY LOG ──────────────────────────────────────────
+@router.get("/deals/{deal_id}")
+async def get_deal(deal_id: str):
+    """Get single deal with contact info"""
+    from app.config import database
 
-@router.get("/activities")
-async def list_activities(
-        contact_id: str = None,
-        limit: int = Query(20, le=100),
-        user=Depends(require_admin),
-):
-    db = get_db()
-    query = {}
-    if contact_id:
-        query["contact_id"] = contact_id
+    try:
+        obj_id = ObjectId(deal_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid deal ID")
 
-    activities = await db.activities.find(query).sort("created_at", -1).limit(limit).to_list(length=limit)
+    deal = await database.db.deals.find_one({"_id": obj_id})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
 
-    for a in activities:
-        contact = await db.contacts.find_one(
-            {"_id": ObjectId(a["contact_id"])}, {"name": 1}
-        )
-        a["contact_name"] = contact["name"] if contact else "Unknown"
+    # Get contact
+    contact = await database.db.contacts.find_one({"_id": ObjectId(deal["contact_id"])})
 
-    return {"activities": [fmt(a) for a in activities]}
-
-
-@router.post("/activities")
-async def log_activity(body: ActivityCreate, user=Depends(require_admin)):
-    db = get_db()
-    contact = await db.contacts.find_one({"_id": ObjectId(body.contact_id)})
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
-
-    doc = {**body.model_dump(), "created_at": datetime.utcnow()}
-    result = await db.activities.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    doc["contact_name"] = contact["name"]
-    return fmt(doc)
-
-
-@router.delete("/activities/{id}")
-async def delete_activity(id: str, user=Depends(require_admin)):
-    db = get_db()
-    result = await db.activities.delete_one({"_id": ObjectId(id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Activity not found")
-    return {"message": "Activity deleted"}
+    return {
+        "id": str(deal["_id"]),
+        "title": deal.get("title", ""),
+        "value": deal.get("value", 0),
+        "currency": deal.get("currency", "EUR"),
+        "stage": deal.get("stage", "lead"),
+        "probability": deal.get("probability", 10),
+        "notes": deal.get("notes", ""),
+        "source": deal.get("source", "manual"),
+        "created_at": deal.get("created_at", datetime.utcnow()).isoformat(),
+        "updated_at": deal.get("updated_at", datetime.utcnow()).isoformat(),
+        "contact": {
+            "id": str(contact["_id"]) if contact else "",
+            "name": contact.get("name", "") if contact else "",
+            "email": contact.get("email", "") if contact else "",
+            "company": contact.get("company", "") if contact else "",
+        }
+    }
