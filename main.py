@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 import uuid
 from datetime import datetime, timezone
+from bson import ObjectId
 
 # ─── LOAD ENV FIRST ──────────────────────────────────────
 
@@ -192,25 +193,65 @@ async def create_status(input: StatusCheckCreate):
 
 # ─── DEMO REQUESTS ───────────────────────────────────────
 
+# ─── DEMO REQUESTS ───────────────────────────────────────
+
 @api_router.post("/demo-requests", response_model=DemoRequest)
 async def create_demo(input: DemoRequestCreate):
-    """Create demo request and optionally sync to CRM"""
+    """Create demo request AND auto-convert to contact + deal"""
+    from bson import ObjectId
+
+    # 1. Save demo request
     demo_dict = input.model_dump()
     demo_obj = DemoRequest(**demo_dict)
-
     doc = demo_obj.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
 
     await db_instance.demo_requests.insert_one(doc)
+    logger.info(f"✅ Demo request created: {input.email}")
 
-    # Try CRM sync but don't fail if it doesn't work
+    # 2. AUTO-CREATE CONTACT (or get existing)
     try:
-        from app.services.crm_bridge import create_or_update_contact, create_deal_if_not_exists
-        contact = await create_or_update_contact(db_instance, doc)
-        await create_deal_if_not_exists(db_instance, contact, doc)
-        logger.info("✅ Demo synced to CRM")
+        existing_contact = await db_instance.contacts.find_one({"email": input.email})
+
+        if not existing_contact:
+            contact_doc = {
+                "name": input.name,
+                "email": input.email,
+                "phone": "",
+                "company": input.company,
+                "role": input.role or "",
+                "industry": input.industry or "",
+                "source": "demo_request",
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            contact_result = await db_instance.contacts.insert_one(contact_doc)
+            contact_id = str(contact_result.inserted_id)
+            logger.info(f"✅ Contact created: {contact_id}")
+        else:
+            contact_id = str(existing_contact["_id"])
+            logger.info(f"ℹ️ Contact exists: {contact_id}")
+
+        # 3. AUTO-CREATE DEAL
+        deal_doc = {
+            "title": f"{input.company} - Demo Request",
+            "contact_id": contact_id,
+            "value": 0,
+            "currency": "EUR",
+            "stage": "lead",
+            "probability": 10,
+            "notes": input.message or "",
+            "source": "demo_request",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+
+        deal_result = await db_instance.deals.insert_one(deal_doc)
+        logger.info(f"✅ Deal created: {str(deal_result.inserted_id)}")
+
     except Exception as e:
-        logger.warning(f"⚠️ CRM sync failed: {e}")
+        logger.error(f"❌ CRM auto-conversion failed: {e}")
+        # Don't fail the demo request - it's already saved
 
     return demo_obj
 
