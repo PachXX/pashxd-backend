@@ -34,6 +34,13 @@ class DealUpdate(BaseModel):
     probability: Optional[int] = None
     title: Optional[str] = None
 
+class ActivityCreate(BaseModel):
+    type: str
+    title: str
+    description: Optional[str] = ""
+    contact_id: Optional[str] = None
+    deal_id: Optional[str] = None
+
 # ==================== CONTACTS ====================
 
 @router.get("/contacts")
@@ -65,7 +72,6 @@ async def create_contact(contact: ContactCreate):
     """Create new contact"""
     from app.config import database
 
-    # Check if email exists
     existing = await database.db.contacts.find_one({"email": contact.email})
     if existing:
         raise HTTPException(status_code=400, detail="Contact with this email already exists")
@@ -77,6 +83,14 @@ async def create_contact(contact: ContactCreate):
     }
 
     result = await database.db.contacts.insert_one(contact_doc)
+
+    await database.db.activities.insert_one({
+        "type": "contact_created",
+        "title": f"New contact: {contact.name}",
+        "description": f"Added {contact.name} from {contact.company or 'Unknown'}",
+        "contact_id": str(result.inserted_id),
+        "created_at": datetime.utcnow(),
+    })
 
     return {
         "id": str(result.inserted_id),
@@ -114,7 +128,6 @@ async def get_pipeline():
 
     deals = await database.db.deals.find({}).to_list(1000)
 
-    # Organize by stage
     pipeline = {
         "lead": [],
         "qualified": [],
@@ -125,7 +138,6 @@ async def get_pipeline():
     }
 
     for deal in deals:
-        # Get contact info
         contact = await database.db.contacts.find_one({"_id": ObjectId(deal["contact_id"])})
 
         deal_data = {
@@ -158,7 +170,6 @@ async def create_deal(deal: DealCreate):
     """Create new deal"""
     from app.config import database
 
-    # Verify contact exists
     contact = await database.db.contacts.find_one({"_id": ObjectId(deal.contact_id)})
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
@@ -171,6 +182,15 @@ async def create_deal(deal: DealCreate):
 
     result = await database.db.deals.insert_one(deal_doc)
 
+    await database.db.activities.insert_one({
+        "type": "deal_created",
+        "title": f"New deal: {deal.title}",
+        "description": f"Deal created for {contact.get('name', 'Unknown')} - €{deal.value:,.2f}",
+        "contact_id": deal.contact_id,
+        "deal_id": str(result.inserted_id),
+        "created_at": datetime.utcnow(),
+    })
+
     return {
         "id": str(result.inserted_id),
         **deal.dict(),
@@ -181,16 +201,19 @@ async def create_deal(deal: DealCreate):
         "updated_at": deal_doc["updated_at"].isoformat(),
     }
 
-@router.patch("/deals/{deal_id}")
+@router.put("/deals/{deal_id}")
 async def update_deal(deal_id: str, updates: DealUpdate):
-    """Update deal (stage, value, notes, etc.)"""
+    """Update deal stage, value, notes - uses PUT method for drag and drop"""
     from app.config import database
 
-    # Validate ObjectId
     try:
         obj_id = ObjectId(deal_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid deal ID")
+
+    old_deal = await database.db.deals.find_one({"_id": obj_id})
+    if not old_deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
 
     update_data = {k: v for k, v in updates.dict().items() if v is not None}
     update_data["updated_at"] = datetime.utcnow()
@@ -202,6 +225,16 @@ async def update_deal(deal_id: str, updates: DealUpdate):
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Deal not found")
+
+    if "stage" in update_data and update_data["stage"] != old_deal.get("stage"):
+        await database.db.activities.insert_one({
+            "type": "deal_stage_changed",
+            "title": f"Deal moved to {update_data['stage']}",
+            "description": f"{old_deal.get('title', 'Deal')} moved from {old_deal.get('stage', 'unknown')} to {update_data['stage']}",
+            "contact_id": old_deal["contact_id"],
+            "deal_id": deal_id,
+            "created_at": datetime.utcnow(),
+        })
 
     return {"success": True, "updated": update_data}
 
@@ -236,7 +269,6 @@ async def get_deal(deal_id: str):
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
 
-    # Get contact
     contact = await database.db.contacts.find_one({"_id": ObjectId(deal["contact_id"])})
 
     return {
@@ -256,4 +288,49 @@ async def get_deal(deal_id: str):
             "email": contact.get("email", "") if contact else "",
             "company": contact.get("company", "") if contact else "",
         }
+    }
+
+# ==================== ACTIVITIES ====================
+
+@router.get("/activities")
+async def get_activities(limit: int = 100):
+    """Get recent activities"""
+    from app.config import database
+
+    try:
+        activities = await database.db.activities.find({}).sort("created_at", -1).limit(limit).to_list(limit)
+
+        return {
+            "activities": [
+                {
+                    "id": str(a["_id"]),
+                    "type": a.get("type", ""),
+                    "title": a.get("title", ""),
+                    "description": a.get("description", ""),
+                    "contact_id": a.get("contact_id"),
+                    "deal_id": a.get("deal_id"),
+                    "created_at": a.get("created_at", datetime.utcnow()).isoformat(),
+                }
+                for a in activities
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/activities")
+async def create_activity(activity: ActivityCreate):
+    """Create new activity log"""
+    from app.config import database
+
+    activity_doc = {
+        **activity.dict(),
+        "created_at": datetime.utcnow(),
+    }
+
+    result = await database.db.activities.insert_one(activity_doc)
+
+    return {
+        "id": str(result.inserted_id),
+        **activity.dict(),
+        "created_at": activity_doc["created_at"].isoformat(),
     }
