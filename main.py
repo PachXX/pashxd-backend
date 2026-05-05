@@ -86,12 +86,6 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs",
 )
-app = FastAPI(
-    title="PashxD API",
-    version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/docs",
-)
 
 # ✅ ADD MIDDLEWARE HERE
 @app.middleware("http")
@@ -139,6 +133,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # ─── MODELS ──────────────────────────────────────────────
 
 class StatusCheck(BaseModel):
@@ -190,8 +185,6 @@ async def create_status(input: StatusCheckCreate):
     doc["timestamp"] = doc["timestamp"].isoformat()
     await db_instance.status_checks.insert_one(doc)
     return obj
-
-# ─── DEMO REQUESTS ───────────────────────────────────────
 
 # ─── DEMO REQUESTS ───────────────────────────────────────
 
@@ -294,6 +287,7 @@ route_modules = [
     "app.routes.auth",
     "app.routes.blog",
     "app.routes.crm",
+    "app.routes.email",  # ← ADD EMAIL ROUTE HERE
     "app.routes.seo",
     "app.routes.dashboard",
 ]
