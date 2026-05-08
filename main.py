@@ -41,6 +41,15 @@ async def lifespan(app: FastAPI):
     try:
         from app.config import database
         database.db = db_instance
+
+        # ✅ Initialize email router database
+        try:
+            from app.routes import email as email_route
+            email_route.set_db(database)
+            logger.info("✅ Email router initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Email router init skipped: {e}")
+
         logger.info(f"✅ Connected to MongoDB: {db_name}")
     except Exception as e:
         logger.warning(f"⚠️ DB config setup skipped: {e}")
@@ -287,7 +296,7 @@ route_modules = [
     "app.routes.auth",
     "app.routes.blog",
     "app.routes.crm",
-    "app.routes.email",  # ← ADD EMAIL ROUTE HERE
+    "app.routes.email",  # ← EMAIL ROUTE
     "app.routes.seo",
     "app.routes.dashboard",
 ]
