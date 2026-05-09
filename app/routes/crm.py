@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Literal
 from datetime import datetime
 from bson import ObjectId
+from app.middleware.auth import get_current_user
 
 router = APIRouter(prefix="/api/crm", tags=["crm"])
 
@@ -16,6 +17,19 @@ class ContactCreate(BaseModel):
     role: Optional[str] = ""
     industry: Optional[str] = ""
     source: str = "manual"
+    status: Optional[str] = "new"
+    notes: Optional[str] = ""
+
+class ContactUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    company: Optional[str] = None
+    role: Optional[str] = None
+    industry: Optional[str] = None
+    source: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
 
 class DealCreate(BaseModel):
     title: str
@@ -44,11 +58,23 @@ class ActivityCreate(BaseModel):
 # ==================== CONTACTS ====================
 
 @router.get("/contacts")
-async def get_contacts():
-    """Get all contacts"""
+async def get_contacts(search: Optional[str] = None, status: Optional[str] = None, limit: int = 100, user=Depends(get_current_user)):
+    """Get all contacts with optional search and filter"""
     from app.config import database
 
-    contacts = await database.db.contacts.find({}).to_list(1000)
+    query = {}
+
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"email": {"$regex": search, "$options": "i"}},
+            {"company": {"$regex": search, "$options": "i"}},
+        ]
+
+    if status and status != "all":
+        query["status"] = status
+
+    contacts = await database.db.contacts.find(query).limit(limit).to_list(limit)
 
     return {
         "contacts": [
@@ -61,14 +87,17 @@ async def get_contacts():
                 "role": c.get("role", ""),
                 "industry": c.get("industry", ""),
                 "source": c.get("source", "manual"),
-                "created_at": c.get("created_at", datetime.utcnow()).isoformat(),
+                "status": c.get("status", "new"),
+                "notes": c.get("notes", ""),
+                "created_at": c.get("created_at", datetime.utcnow()).isoformat() if isinstance(c.get("created_at"), datetime) else c.get("created_at"),
+                "updated_at": c.get("updated_at", datetime.utcnow()).isoformat() if isinstance(c.get("updated_at"), datetime) else c.get("updated_at"),
             }
             for c in contacts
         ]
     }
 
 @router.post("/contacts")
-async def create_contact(contact: ContactCreate):
+async def create_contact(contact: ContactCreate, user=Depends(get_current_user)):
     """Create new contact"""
     from app.config import database
 
@@ -96,14 +125,20 @@ async def create_contact(contact: ContactCreate):
         "id": str(result.inserted_id),
         **contact.dict(),
         "created_at": contact_doc["created_at"].isoformat(),
+        "updated_at": contact_doc["updated_at"].isoformat(),
     }
 
 @router.get("/contacts/{contact_id}")
-async def get_contact(contact_id: str):
+async def get_contact(contact_id: str, user=Depends(get_current_user)):
     """Get single contact"""
     from app.config import database
 
-    contact = await database.db.contacts.find_one({"_id": ObjectId(contact_id)})
+    try:
+        obj_id = ObjectId(contact_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid contact ID")
+
+    contact = await database.db.contacts.find_one({"_id": obj_id})
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
 
@@ -116,13 +151,85 @@ async def get_contact(contact_id: str):
         "role": contact.get("role", ""),
         "industry": contact.get("industry", ""),
         "source": contact.get("source", "manual"),
-        "created_at": contact.get("created_at", datetime.utcnow()).isoformat(),
+        "status": contact.get("status", "new"),
+        "notes": contact.get("notes", ""),
+        "created_at": contact.get("created_at", datetime.utcnow()).isoformat() if isinstance(contact.get("created_at"), datetime) else contact.get("created_at"),
+        "updated_at": contact.get("updated_at", datetime.utcnow()).isoformat() if isinstance(contact.get("updated_at"), datetime) else contact.get("updated_at"),
     }
+
+@router.put("/contacts/{contact_id}")
+async def update_contact(contact_id: str, updates: ContactUpdate, user=Depends(get_current_user)):
+    """Update contact"""
+    from app.config import database
+
+    try:
+        obj_id = ObjectId(contact_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid contact ID")
+
+    contact = await database.db.contacts.find_one({"_id": obj_id})
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    # Check if new email already exists
+    if updates.email and updates.email != contact.get("email"):
+        existing = await database.db.contacts.find_one({"email": updates.email})
+        if existing:
+            raise HTTPException(status_code=400, detail="Contact with this email already exists")
+
+    update_data = {k: v for k, v in updates.dict().items() if v is not None}
+    update_data["updated_at"] = datetime.utcnow()
+
+    result = await database.db.contacts.update_one(
+        {"_id": obj_id},
+        {"$set": update_data}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    return {
+        "success": True,
+        "id": contact_id,
+        "updated": update_data
+    }
+
+@router.delete("/contacts/{contact_id}")
+async def delete_contact(contact_id: str, user=Depends(get_current_user)):
+    """Delete contact"""
+    from app.config import database
+
+    try:
+        obj_id = ObjectId(contact_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid contact ID")
+
+    contact = await database.db.contacts.find_one({"_id": obj_id})
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    # Delete associated deals
+    await database.db.deals.delete_many({"contact_id": contact_id})
+
+    # Delete the contact
+    result = await database.db.contacts.delete_one({"_id": obj_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    await database.db.activities.insert_one({
+        "type": "contact_deleted",
+        "title": f"Contact deleted: {contact.get('name', 'Unknown')}",
+        "description": f"Deleted {contact.get('name', 'Unknown')} ({contact.get('email', 'Unknown')})",
+        "created_at": datetime.utcnow(),
+    })
+
+    return {"success": True, "message": "Contact deleted successfully"}
 
 # ==================== DEALS/PIPELINE ====================
 
 @router.get("/pipeline")
-async def get_pipeline():
+async def get_pipeline(user=Depends(get_current_user)):
     """Get all deals organized by stage"""
     from app.config import database
 
@@ -166,11 +273,15 @@ async def get_pipeline():
     return pipeline
 
 @router.post("/deals")
-async def create_deal(deal: DealCreate):
+async def create_deal(deal: DealCreate, user=Depends(get_current_user)):
     """Create new deal"""
     from app.config import database
 
-    contact = await database.db.contacts.find_one({"_id": ObjectId(deal.contact_id)})
+    try:
+        contact = await database.db.contacts.find_one({"_id": ObjectId(deal.contact_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid contact ID")
+
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
 
@@ -202,7 +313,7 @@ async def create_deal(deal: DealCreate):
     }
 
 @router.put("/deals/{deal_id}")
-async def update_deal(deal_id: str, updates: DealUpdate):
+async def update_deal(deal_id: str, updates: DealUpdate, user=Depends(get_current_user)):
     """Update deal stage, value, notes - uses PUT method for drag and drop"""
     from app.config import database
 
@@ -239,7 +350,7 @@ async def update_deal(deal_id: str, updates: DealUpdate):
     return {"success": True, "updated": update_data}
 
 @router.delete("/deals/{deal_id}")
-async def delete_deal(deal_id: str):
+async def delete_deal(deal_id: str, user=Depends(get_current_user)):
     """Delete deal"""
     from app.config import database
 
@@ -256,7 +367,7 @@ async def delete_deal(deal_id: str):
     return {"success": True}
 
 @router.get("/deals/{deal_id}")
-async def get_deal(deal_id: str):
+async def get_deal(deal_id: str, user=Depends(get_current_user)):
     """Get single deal with contact info"""
     from app.config import database
 
@@ -293,7 +404,7 @@ async def get_deal(deal_id: str):
 # ==================== ACTIVITIES ====================
 
 @router.get("/activities")
-async def get_activities(limit: int = 100):
+async def get_activities(limit: int = 100, user=Depends(get_current_user)):
     """Get recent activities"""
     from app.config import database
 
@@ -318,7 +429,7 @@ async def get_activities(limit: int = 100):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/activities")
-async def create_activity(activity: ActivityCreate):
+async def create_activity(activity: ActivityCreate, user=Depends(get_current_user)):
     """Create new activity log"""
     from app.config import database
 
