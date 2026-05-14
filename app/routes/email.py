@@ -61,6 +61,66 @@ def serialize_doc(doc, fields=None):
             result[key] = val
     return result
 
+def extract_contact_variables(contact: dict) -> dict:
+    """
+    Extract all available variables from a contact document.
+    Handles both 'name' and 'first_name'/'last_name' formats.
+    """
+    # Get first name
+    first_name = contact.get("first_name", "")
+    if not first_name and contact.get("name"):
+        # If no first_name, try to split from name field
+        parts = contact.get("name", "").split()
+        first_name = parts[0] if parts else ""
+
+    # Get last name
+    last_name = contact.get("last_name", "")
+    if not last_name and contact.get("name"):
+        # If no last_name, try to extract from name field
+        parts = contact.get("name", "").split()
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    # Get full name
+    full_name = contact.get("full_name", "")
+    if not full_name:
+        if first_name and last_name:
+            full_name = f"{first_name} {last_name}"
+        elif first_name or last_name:
+            full_name = f"{first_name} {last_name}".strip()
+        else:
+            full_name = contact.get("name", "")
+
+    return {
+        "first_name": first_name,
+        "last_name": last_name,
+        "full_name": full_name,
+        "company_name": contact.get("company_name") or contact.get("company") or "",
+        "job_title": contact.get("job_title") or contact.get("role") or "",
+        "email": contact.get("email", ""),
+        "meeting_date": contact.get("meeting_date", ""),
+        "deal_value": contact.get("deal_value", ""),
+    }
+
+def replace_variables_in_text(text: str, variables: dict) -> str:
+    """
+    Replace all {{variable}} placeholders with actual values.
+    Handles both single and double braces.
+    """
+    if not text:
+        return text
+
+    result = text
+    for key, value in variables.items():
+        if value is None:
+            value = ""
+        value_str = str(value).strip()
+        # Replace {{key}} format
+        result = result.replace(f"{{{{{key}}}}}", value_str)
+        # Also replace {{key}} with single braces (just in case)
+        result = result.replace(f"{{{key}}}", value_str)
+
+    return result
+
 def inject_tracking(html_body: str, campaign_id: str, contact_email: str) -> str:
     """Inject open-tracking pixel and wrap links for click tracking"""
     # 1) Open tracking pixel
@@ -200,8 +260,8 @@ async def send_email(request: SendEmailRequest):
     subject = request.subject
     body = request.body
     for key, value in request.variables.items():
-        subject = subject.replace(f"{{{{{key}}}}}", str(value))
-        body = body.replace(f"{{{{{key}}}}}", str(value))
+        subject = replace_variables_in_text(subject, {key: value})
+        body = replace_variables_in_text(body, {key: value})
 
     # Create email log entry first so we have an ID for tracking
     email_log = {
@@ -495,7 +555,7 @@ async def delete_campaign(campaign_id: str):
 
 @router.post("/campaigns/{campaign_id}/send")
 async def send_campaign(campaign_id: str):
-    """Execute a campaign"""
+    """Execute a campaign - with proper variable replacement"""
     db = get_db()
     campaign = await db.db.email_campaigns.find_one({"_id": obj_id(campaign_id)})
     if not campaign:
@@ -533,27 +593,24 @@ async def send_campaign(campaign_id: str):
 
     for contact in contacts:
         contact_email = contact.get("email", "")
-        contact_name = contact.get("name", "")
         if not contact_email:
+            failed_count += 1
             continue
 
-        variables = {
-            "first_name": contact_name.split()[0] if contact_name else "",
-            "full_name": contact_name,
-            "company_name": contact.get("company", ""),
-            "job_title": contact.get("role", ""),
-            "email": contact_email,
-        }
+        # 🔥 FIX: Use the new extract_contact_variables function
+        variables = extract_contact_variables(contact)
 
+        # Get template content
         subject = template.get("subject", "")
         body = template.get("body", "")
-        for key, value in variables.items():
-            subject = subject.replace(f"{{{{{key}}}}}", str(value))
-            body = body.replace(f"{{{{{key}}}}}", str(value))
+
+        # Replace variables using the new function
+        subject = replace_variables_in_text(subject, variables)
+        body = replace_variables_in_text(body, variables)
 
         email_log = {
             "to_email": contact_email,
-            "to_name": contact_name,
+            "to_name": variables.get("full_name", ""),
             "subject": subject,
             "body": body,
             "template_id": campaign.get("template_id", ""),
@@ -583,7 +640,7 @@ async def send_campaign(campaign_id: str):
                         },
                         json={
                             "personalizations": [
-                                {"to": [{"email": contact_email, "name": contact_name}], "subject": subject}
+                                {"to": [{"email": contact_email, "name": variables.get("full_name", "")}], "subject": subject}
                             ],
                             "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
                             "content": [{"type": "text/html", "value": tracked_body}],
