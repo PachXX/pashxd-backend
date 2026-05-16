@@ -21,6 +21,11 @@ class BlogCreate(BaseModel):
     og_image: Optional[str] = ""
     keywords: List[str] = []
     status: str = "draft"  # draft, published
+    # ✅ NEW: Content type support
+    content_type: str = "markdown"  # markdown | html
+    custom_html: Optional[str] = ""
+    custom_css: Optional[str] = ""
+    word_count: Optional[int] = None
 
 class BlogUpdate(BaseModel):
     title: Optional[str] = None
@@ -34,6 +39,11 @@ class BlogUpdate(BaseModel):
     og_image: Optional[str] = None
     keywords: Optional[List[str]] = None
     status: Optional[str] = None
+    # ✅ NEW: Content type support
+    content_type: Optional[str] = None
+    custom_html: Optional[str] = None
+    custom_css: Optional[str] = None
+    word_count: Optional[int] = None
 
 # ==================== HELPERS ====================
 
@@ -70,6 +80,8 @@ async def get_published_blogs():
                 "cover_image": b.get("cover_image", ""),
                 "author": b.get("author", "PashxD Team"),
                 "reading_time": b.get("reading_time", 5),
+                "word_count": b.get("word_count", 0),
+                "content_type": b.get("content_type", "markdown"),  # ✅ NEW
                 "created_at": b.get("created_at", datetime.utcnow()).isoformat(),
                 "updated_at": b.get("updated_at", datetime.utcnow()).isoformat(),
             }
@@ -102,6 +114,10 @@ async def get_blog_by_slug(slug: str):
         "meta_description": blog.get("meta_description", ""),
         "og_image": blog.get("og_image", ""),
         "keywords": blog.get("keywords", []),
+        # ✅ NEW: Return content type fields
+        "content_type": blog.get("content_type", "markdown"),
+        "custom_html": blog.get("custom_html", ""),
+        "custom_css": blog.get("custom_css", ""),
         "created_at": blog.get("created_at", datetime.utcnow()).isoformat(),
         "updated_at": blog.get("updated_at", datetime.utcnow()).isoformat(),
     }
@@ -133,6 +149,10 @@ async def get_all_blogs_admin():
                 "meta_description": b.get("meta_description", ""),
                 "og_image": b.get("og_image", ""),
                 "keywords": b.get("keywords", []),
+                # ✅ NEW: Include content type fields
+                "content_type": b.get("content_type", "markdown"),
+                "custom_html": b.get("custom_html", ""),
+                "custom_css": b.get("custom_css", ""),
                 "created_at": b.get("created_at", datetime.utcnow()).isoformat(),
                 "updated_at": b.get("updated_at", datetime.utcnow()).isoformat(),
             }
@@ -146,8 +166,14 @@ async def create_blog(blog: BlogCreate):
     from app.config import database
 
     slug = generate_slug(blog.title)
-    word_count = len(re.findall(r'\w+', blog.content))
-    reading_time = calculate_reading_time(blog.content)
+
+    # ✅ FIXED: Calculate word_count from correct field
+    if blog.content_type == "html":
+        word_count = len(re.findall(r'\w+', blog.custom_html or ""))
+    else:
+        word_count = len(re.findall(r'\w+', blog.content or ""))
+
+    reading_time = calculate_reading_time(blog.custom_html if blog.content_type == "html" else blog.content)
 
     # Check if slug exists
     existing = await database.db.blogs.find_one({"slug": slug})
@@ -186,10 +212,21 @@ async def update_blog(blog_id: str, updates: BlogUpdate):
 
     update_data = {k: v for k, v in updates.dict().items() if v is not None}
 
-    # Recalculate if content changed
-    if "content" in update_data:
-        update_data["word_count"] = len(re.findall(r'\w+', update_data["content"]))
-        update_data["reading_time"] = calculate_reading_time(update_data["content"])
+    # ✅ FIXED: Recalculate word_count based on content_type
+    content_type = update_data.get("content_type")
+
+    if "content" in update_data or "custom_html" in update_data or content_type:
+        # Get existing blog to know its content_type if not updating it
+        existing_blog = await database.db.blogs.find_one({"_id": obj_id})
+        current_type = content_type or existing_blog.get("content_type", "markdown")
+
+        if current_type == "html":
+            text = update_data.get("custom_html", existing_blog.get("custom_html", ""))
+        else:
+            text = update_data.get("content", existing_blog.get("content", ""))
+
+        update_data["word_count"] = len(re.findall(r'\w+', text))
+        update_data["reading_time"] = calculate_reading_time(text)
 
     # Regenerate slug if title changed
     if "title" in update_data:

@@ -23,6 +23,10 @@ class UserOut(BaseModel):
 
 # ─── BLOG MODELS ─────────────────────────────────────────
 
+class ContentType(str, Enum):
+    markdown = "markdown"
+    html = "html"
+
 class BlogStatus(str, Enum):
     draft = "draft"
     published = "published"
@@ -35,11 +39,16 @@ class BlogCreate(BaseModel):
     tags: List[str] = []
     cover_image: Optional[str] = None
     status: BlogStatus = BlogStatus.draft
+    # Content type support
+    content_type: ContentType = ContentType.markdown
+    custom_html: Optional[str] = None
+    custom_css: Optional[str] = None
     # SEO fields (manual)
     meta_title: Optional[str] = None
     meta_description: Optional[str] = None
     og_image: Optional[str] = None
     keywords: List[str] = []
+    word_count: Optional[int] = None
 
 class BlogUpdate(BaseModel):
     title: Optional[str] = None
@@ -49,10 +58,14 @@ class BlogUpdate(BaseModel):
     tags: Optional[List[str]] = None
     cover_image: Optional[str] = None
     status: Optional[BlogStatus] = None
+    content_type: Optional[ContentType] = None
+    custom_html: Optional[str] = None
+    custom_css: Optional[str] = None
     meta_title: Optional[str] = None
     meta_description: Optional[str] = None
     og_image: Optional[str] = None
     keywords: Optional[List[str]] = None
+    word_count: Optional[int] = None
 
 class BlogOut(BaseModel):
     id: str
@@ -64,6 +77,9 @@ class BlogOut(BaseModel):
     tags: List[str]
     cover_image: Optional[str]
     status: str
+    content_type: str
+    custom_html: Optional[str]
+    custom_css: Optional[str]
     meta_title: Optional[str]
     meta_description: Optional[str]
     og_image: Optional[str]
