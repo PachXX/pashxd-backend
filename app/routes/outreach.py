@@ -337,6 +337,37 @@ async def skip_draft(draft_id: str, user=Depends(require_admin)):
     return {"ok": True}
 
 
+@router.post("/reset")
+async def reset_outreach(pending_only: bool = True, user=Depends(require_admin)):
+    """
+    Clear outreach state so sequences re-draft from scratch.
+    pending_only=True (default): delete only pending drafts and reset their
+    sequences back to step 0 (safe — never touches already-sent history).
+    pending_only=False: wipe ALL drafts + sequences.
+    """
+    from app.config import database
+    db = database
+
+    if not pending_only:
+        d = await db.db.outreach_drafts.delete_many({})
+        s = await db.db.outreach_sequences.delete_many({})
+        return {"ok": True, "drafts_deleted": d.deleted_count, "sequences_deleted": s.deleted_count}
+
+    pending = await db.db.outreach_drafts.find({"status": "pending"}).to_list(1000)
+    seq_ids = {p.get("sequence_id") for p in pending if p.get("sequence_id")}
+    d = await db.db.outreach_drafts.delete_many({"status": "pending"})
+    reset = 0
+    for sid in seq_ids:
+        # only reset sequences that have no sent/approved drafts left
+        sent = await db.db.outreach_drafts.count_documents(
+            {"sequence_id": sid, "status": {"$in": ["sent", "approved"]}}
+        )
+        if sent == 0:
+            await db.db.outreach_sequences.delete_one({"_id": _oid(sid)})
+            reset += 1
+    return {"ok": True, "drafts_deleted": d.deleted_count, "sequences_reset": reset}
+
+
 @router.get("/sequences")
 async def list_sequences(status: Optional[str] = None, limit: int = 200, user=Depends(get_current_user)):
     from app.config import database
