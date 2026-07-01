@@ -14,7 +14,7 @@ Nothing is ever auto-sent. Sequence state lives here (dashboard-authoritative).
 """
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Any
+from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -137,6 +137,8 @@ async def get_due(limit: int = 15, user=Depends(get_current_user)):
                 {"_id": seq["_id"]},
                 {"$set": {"status": "hot", "updated_at": _now()}},
             )
+            seq["status"] = "hot"
+            await _sync_contact(db, seq)
             continue
         # skip if a draft already exists for this step (avoid dupes on re-run)
         dup = await db.db.outreach_drafts.count_documents(
@@ -222,6 +224,16 @@ async def create_draft(draft: DraftCreate, user=Depends(require_admin)):
         seq_id = str(res.inserted_id)
         seq = {**seq_doc, "_id": res.inserted_id}
     else:
+        if seq.get("status") != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Sequence is {seq.get('status')}, not active — cannot draft a new touch",
+            )
+        if draft.step != seq.get("current_step"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Sequence is at step {seq.get('current_step')}, draft targets step {draft.step}",
+            )
         seq_id = _sid(seq)
 
     c = CADENCE[draft.step] if draft.step <= MAX_STEP else CADENCE[MAX_STEP]

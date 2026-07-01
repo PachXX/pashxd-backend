@@ -125,8 +125,7 @@ async def list_agents(user=Depends(get_current_user)):
 
     result = []
     for a in AGENTS:
-        runs_cursor = database.db.agent_runs.find({"agent": a["id"]}).sort("created_at", -1)
-        recent = await runs_cursor.to_list(50)
+        recent = await database.db.agent_runs.find({"agent": a["id"]}).sort("created_at", -1).to_list(1)
 
         last_run = _serialize_run(recent[0]) if recent else None
         total = await database.db.agent_runs.count_documents({"agent": a["id"]})
