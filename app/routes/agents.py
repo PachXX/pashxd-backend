@@ -56,6 +56,14 @@ AGENTS = [
         "schedule": {"hour": 9, "minute": 0},
         "schedule_label": "Daily · 09:00",
     },
+    {
+        "id": "outreach",
+        "label": "Outreach Agent",
+        "description": "Drafts hyper-personalised cold emails + follow-ups for pipeline contacts. Draft-for-approval; nothing auto-sends.",
+        "icon": "send",
+        "schedule": {"hour": 8, "minute": 30},
+        "schedule_label": "Daily · 08:30",
+    },
 ]
 
 AGENT_IDS = {a["id"] for a in AGENTS}

@@ -1,0 +1,386 @@
+"""
+Outreach router — draft-for-approval cold email sequencing.
+
+Flow:
+  1. Agent calls GET /due -> tasks (new intros + followups that are due).
+  2. Agent generates hyper-personalised HTML per task, POSTs to /drafts.
+  3. Operator reviews drafts in the dashboard:
+       - POST /drafts/{id}/approve -> sends via SendGrid, logs, advances sequence.
+       - POST /drafts/{id}/skip    -> advances sequence without sending.
+  4. Engagement: if a prior email was clicked, the sequence is marked "hot"
+     and no further drafts are generated (operator handles personally).
+
+Nothing is ever auto-sent. Sequence state lives here (dashboard-authoritative).
+"""
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Any
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+
+from app.middleware.auth import get_current_user, require_admin
+
+router = APIRouter(prefix="/api/outreach", tags=["outreach"])
+
+# ─── CADENCE ──────────────────────────────────────────────────────────────────
+# 4 touches: Day 0 / 3 / 7 / 12. gap_days = days after previous send.
+CADENCE = [
+    {"step": 0, "kind": "intro",    "gap_days": 0,  "label": "Intro"},
+    {"step": 1, "kind": "followup", "gap_days": 3,  "label": "Follow-up"},
+    {"step": 2, "kind": "value",    "gap_days": 4,  "label": "Value / proof"},
+    {"step": 3, "kind": "breakup",  "gap_days": 5,  "label": "Breakup"},
+]
+MAX_STEP = len(CADENCE) - 1
+
+# Which CRM contact sources are eligible for enrollment.
+LEAD_SOURCES = ["saudi-lead-agent", "uk-lead-agent", "lead-agent"]
+
+NOTIFY_CC = os.getenv("OUTREACH_CC", "moideenshahil2@gmail.com")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "shahil@pashx.com")
+SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "Shahil from PashxD")
+
+
+# ─── MODELS ───────────────────────────────────────────────────────────────────
+
+class DraftCreate(BaseModel):
+    contact_id: str
+    step: int = Field(ge=0, le=MAX_STEP)
+    subject: str
+    body_html: str
+    personalization_notes: Optional[str] = None
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _sid(doc: dict) -> str:
+    return str(doc.get("_id", ""))
+
+
+def _serialize_seq(s: dict) -> dict:
+    return {
+        "id": _sid(s),
+        "contact_id": s.get("contact_id"),
+        "contact_name": s.get("contact_name"),
+        "contact_email": s.get("contact_email"),
+        "company": s.get("company"),
+        "status": s.get("status"),
+        "current_step": s.get("current_step"),
+        "started_at": s.get("started_at"),
+        "last_sent_at": s.get("last_sent_at"),
+        "next_due_at": s.get("next_due_at"),
+    }
+
+
+def _serialize_draft(d: dict) -> dict:
+    return {
+        "id": _sid(d),
+        "sequence_id": d.get("sequence_id"),
+        "contact_id": d.get("contact_id"),
+        "contact_name": d.get("contact_name"),
+        "contact_email": d.get("contact_email"),
+        "company": d.get("company"),
+        "step": d.get("step"),
+        "kind": d.get("kind"),
+        "subject": d.get("subject"),
+        "body_html": d.get("body_html"),
+        "status": d.get("status"),
+        "personalization_notes": d.get("personalization_notes"),
+        "created_at": d.get("created_at"),
+        "sent_at": d.get("sent_at"),
+    }
+
+
+async def _engagement(db, email: str) -> dict:
+    """Any opens/clicks across this contact's prior logged emails."""
+    if not email:
+        return {"opened": False, "clicked": False}
+    opened = await db.db.email_logs.count_documents({"to_email": email, "opened_at": {"$ne": None}})
+    clicked = await db.db.email_logs.count_documents({"to_email": email, "clicked_at": {"$ne": None}})
+    return {"opened": opened > 0, "clicked": clicked > 0}
+
+
+# ─── DUE (agent pulls work) ───────────────────────────────────────────────────
+
+@router.get("/due")
+async def get_due(limit: int = 15, user=Depends(get_current_user)):
+    """
+    Tasks the outreach agent should draft now:
+      - new intros: eligible lead contacts with no sequence yet
+      - followups: active sequences past next_due_at with no pending draft
+    Contacts that clicked a prior email are marked 'hot' and skipped.
+    """
+    from app.config import database
+    db = database
+    limit = max(1, min(limit, 50))
+    tasks: list[dict] = []
+
+    # 1) Followups on active sequences that are due
+    active = await db.db.outreach_sequences.find(
+        {"status": "active", "next_due_at": {"$lte": _now()}}
+    ).sort("next_due_at", 1).to_list(limit)
+
+    for seq in active:
+        step = seq.get("current_step", 0)
+        if step > MAX_STEP:
+            continue
+        # engagement gate: click -> mark hot, stop
+        eng = await _engagement(db, seq.get("contact_email", ""))
+        if eng["clicked"]:
+            await db.db.outreach_sequences.update_one(
+                {"_id": seq["_id"]},
+                {"$set": {"status": "hot", "updated_at": _now()}},
+            )
+            continue
+        # skip if a draft already exists for this step (avoid dupes on re-run)
+        dup = await db.db.outreach_drafts.count_documents(
+            {"sequence_id": _sid(seq), "step": step, "status": {"$in": ["pending", "approved", "sent"]}}
+        )
+        if dup:
+            continue
+        c = CADENCE[step]
+        tasks.append({
+            "sequence_id": _sid(seq),
+            "contact_id": seq.get("contact_id"),
+            "contact_name": seq.get("contact_name"),
+            "contact_email": seq.get("contact_email"),
+            "company": seq.get("company"),
+            "notes": seq.get("notes", ""),
+            "step": step,
+            "kind": c["kind"],
+            "engagement": eng,
+            "is_new": False,
+        })
+
+    # 2) New intros: eligible lead contacts not yet enrolled
+    remaining = limit - len(tasks)
+    if remaining > 0:
+        enrolled_ids = set(
+            s.get("contact_id") for s in await db.db.outreach_sequences.find({}, {"contact_id": 1}).to_list(5000)
+        )
+        candidates = await db.db.contacts.find(
+            {"source": {"$in": LEAD_SOURCES}, "email": {"$nin": ["", None]}}
+        ).sort("created_at", -1).to_list(500)
+        for c in candidates:
+            if remaining <= 0:
+                break
+            cid = str(c["_id"])
+            if cid in enrolled_ids:
+                continue
+            tasks.append({
+                "sequence_id": None,
+                "contact_id": cid,
+                "contact_name": c.get("name", ""),
+                "contact_email": c.get("email", ""),
+                "company": c.get("company", ""),
+                "notes": c.get("notes", ""),
+                "step": 0,
+                "kind": "intro",
+                "engagement": {"opened": False, "clicked": False},
+                "is_new": True,
+            })
+            remaining -= 1
+
+    return {"tasks": tasks, "cadence": CADENCE}
+
+
+# ─── DRAFTS ───────────────────────────────────────────────────────────────────
+
+@router.post("/drafts")
+async def create_draft(draft: DraftCreate, user=Depends(require_admin)):
+    """Agent stores a generated draft. Enrolls the contact if not already."""
+    from app.config import database
+    db = database
+
+    contact = await db.db.contacts.find_one({"_id": _oid(draft.contact_id)})
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    seq = await db.db.outreach_sequences.find_one({"contact_id": draft.contact_id})
+    if not seq:
+        seq_doc = {
+            "contact_id": draft.contact_id,
+            "contact_name": contact.get("name", ""),
+            "contact_email": contact.get("email", ""),
+            "company": contact.get("company", ""),
+            "notes": contact.get("notes", ""),
+            "status": "active",
+            "current_step": draft.step,
+            "started_at": _now(),
+            "last_sent_at": None,
+            "next_due_at": _now(),
+            "created_at": _now(),
+            "updated_at": _now(),
+        }
+        res = await db.db.outreach_sequences.insert_one(seq_doc)
+        seq_id = str(res.inserted_id)
+        seq = {**seq_doc, "_id": res.inserted_id}
+    else:
+        seq_id = _sid(seq)
+
+    c = CADENCE[draft.step] if draft.step <= MAX_STEP else CADENCE[MAX_STEP]
+    doc = {
+        "sequence_id": seq_id,
+        "contact_id": draft.contact_id,
+        "contact_name": seq.get("contact_name"),
+        "contact_email": seq.get("contact_email"),
+        "company": seq.get("company"),
+        "step": draft.step,
+        "kind": c["kind"],
+        "subject": draft.subject,
+        "body_html": draft.body_html,
+        "personalization_notes": draft.personalization_notes,
+        "status": "pending",
+        "created_at": _now(),
+        "sent_at": None,
+    }
+    res = await db.db.outreach_drafts.insert_one(doc)
+    return {"ok": True, "id": str(res.inserted_id), "sequence_id": seq_id}
+
+
+@router.get("/drafts")
+async def list_drafts(status: str = "pending", limit: int = 100, user=Depends(get_current_user)):
+    from app.config import database
+    db = database
+    limit = max(1, min(limit, 200))
+    q = {} if status == "all" else {"status": status}
+    drafts = await db.db.outreach_drafts.find(q).sort("created_at", -1).to_list(limit)
+    return {"drafts": [_serialize_draft(d) for d in drafts]}
+
+
+@router.post("/drafts/{draft_id}/approve")
+async def approve_draft(draft_id: str, user=Depends(require_admin)):
+    """Send the drafted email via SendGrid, log it, advance the sequence."""
+    from app.config import database
+    db = database
+
+    draft = await db.db.outreach_drafts.find_one({"_id": _oid(draft_id)})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("status") != "pending":
+        raise HTTPException(status_code=400, detail=f"Draft is {draft.get('status')}, not pending")
+
+    to_email = draft.get("contact_email", "")
+    if not to_email:
+        raise HTTPException(status_code=400, detail="Draft has no recipient email")
+
+    # Log first so tracking id exists
+    log_doc = {
+        "to_email": to_email,
+        "to_name": draft.get("contact_name", ""),
+        "subject": draft.get("subject", ""),
+        "body": draft.get("body_html", ""),
+        "campaign_id": "outreach",
+        "status": "pending",
+        "sent_at": None, "opened_at": None, "clicked_at": None,
+        "open_count": 0, "click_count": 0,
+        "created_at": _now(),
+    }
+    log_res = await db.db.email_logs.insert_one(log_doc)
+
+    sent_ok = False
+    error = None
+    if SENDGRID_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.sendgrid.com/v3/mail/send",
+                    headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "personalizations": [{
+                            "to": [{"email": to_email, "name": draft.get("contact_name", "")}],
+                            "cc": [{"email": NOTIFY_CC}],
+                            "subject": draft.get("subject", ""),
+                        }],
+                        "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
+                        "content": [{"type": "text/html", "value": draft.get("body_html", "")}],
+                    },
+                )
+                sent_ok = resp.status_code in (200, 201, 202)
+                if not sent_ok:
+                    error = f"SendGrid {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            error = str(e)
+    else:
+        error = "SENDGRID_API_KEY not configured"
+
+    if not sent_ok:
+        await db.db.email_logs.update_one({"_id": log_res.inserted_id}, {"$set": {"status": "failed"}})
+        raise HTTPException(status_code=502, detail=error or "Send failed")
+
+    await db.db.email_logs.update_one(
+        {"_id": log_res.inserted_id}, {"$set": {"status": "sent", "sent_at": _now()}}
+    )
+    await db.db.outreach_drafts.update_one(
+        {"_id": draft["_id"]}, {"$set": {"status": "sent", "sent_at": _now()}}
+    )
+    await _advance(db, draft)
+    return {"ok": True}
+
+
+@router.post("/drafts/{draft_id}/skip")
+async def skip_draft(draft_id: str, user=Depends(require_admin)):
+    """Discard this draft and advance the sequence without sending."""
+    from app.config import database
+    db = database
+    draft = await db.db.outreach_drafts.find_one({"_id": _oid(draft_id)})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("status") != "pending":
+        raise HTTPException(status_code=400, detail=f"Draft is {draft.get('status')}, not pending")
+    await db.db.outreach_drafts.update_one({"_id": draft["_id"]}, {"$set": {"status": "skipped"}})
+    await _advance(db, draft)
+    return {"ok": True}
+
+
+@router.get("/sequences")
+async def list_sequences(status: Optional[str] = None, limit: int = 200, user=Depends(get_current_user)):
+    from app.config import database
+    db = database
+    limit = max(1, min(limit, 500))
+    q = {} if not status else {"status": status}
+    seqs = await db.db.outreach_sequences.find(q).sort("updated_at", -1).to_list(limit)
+    counts = {}
+    for st in ["active", "hot", "completed", "stopped"]:
+        counts[st] = await db.db.outreach_sequences.count_documents({"status": st})
+    return {"sequences": [_serialize_seq(s) for s in seqs], "counts": counts}
+
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def _oid(id_str: str):
+    from bson import ObjectId
+    try:
+        return ObjectId(id_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id")
+
+
+async def _advance(db, draft: dict):
+    """Advance the sequence after a touch is sent or skipped."""
+    seq = await db.db.outreach_sequences.find_one({"_id": _oid(draft["sequence_id"])})
+    if not seq:
+        return
+    step = draft.get("step", seq.get("current_step", 0))
+    next_step = step + 1
+    if next_step > MAX_STEP:
+        await db.db.outreach_sequences.update_one(
+            {"_id": seq["_id"]},
+            {"$set": {"status": "completed", "current_step": next_step,
+                      "last_sent_at": _now(), "updated_at": _now()}},
+        )
+        return
+    gap = CADENCE[next_step]["gap_days"]
+    await db.db.outreach_sequences.update_one(
+        {"_id": seq["_id"]},
+        {"$set": {
+            "current_step": next_step,
+            "last_sent_at": _now(),
+            "next_due_at": _now() + timedelta(days=gap),
+            "updated_at": _now(),
+        }},
+    )

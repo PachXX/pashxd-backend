@@ -301,6 +301,7 @@ route_modules = [
     "app.routes.seo",
     "app.routes.dashboard",
     "app.routes.agents",
+    "app.routes.outreach",
 ]
 
 for route_path in route_modules:
