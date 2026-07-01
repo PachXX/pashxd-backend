@@ -51,6 +51,7 @@ class DraftCreate(BaseModel):
     subject: str
     body_html: str
     personalization_notes: Optional[str] = None
+    cc_emails: Optional[list[str]] = None
 
 
 def _now() -> datetime:
@@ -90,6 +91,7 @@ def _serialize_draft(d: dict) -> dict:
         "body_html": d.get("body_html"),
         "status": d.get("status"),
         "personalization_notes": d.get("personalization_notes"),
+        "cc_emails": d.get("cc_emails") or [],
         "created_at": d.get("created_at"),
         "sent_at": d.get("sent_at"),
     }
@@ -234,6 +236,7 @@ async def create_draft(draft: DraftCreate, user=Depends(require_admin)):
         "subject": draft.subject,
         "body_html": draft.body_html,
         "personalization_notes": draft.personalization_notes,
+        "cc_emails": draft.cc_emails or [],
         "status": "pending",
         "created_at": _now(),
         "sent_at": None,
@@ -285,6 +288,10 @@ async def approve_draft(draft_id: str, user=Depends(require_admin)):
     sent_ok = False
     error = None
     if SENDGRID_API_KEY:
+        cc_list = [{"email": NOTIFY_CC}]
+        for e in (draft.get("cc_emails") or []):
+            if e and e.lower() != NOTIFY_CC.lower():
+                cc_list.append({"email": e})
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
@@ -293,7 +300,7 @@ async def approve_draft(draft_id: str, user=Depends(require_admin)):
                     json={
                         "personalizations": [{
                             "to": [{"email": to_email, "name": draft.get("contact_name", "")}],
-                            "cc": [{"email": NOTIFY_CC}],
+                            "cc": cc_list,
                             "subject": draft.get("subject", ""),
                         }],
                         "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
