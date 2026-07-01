@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query, Depends
 from fastapi.responses import RedirectResponse, Response
+from app.middleware.auth import require_admin
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -11,10 +12,32 @@ import io
 import uuid
 import logging
 import re
+from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/email", tags=["email"])
+_SAFE_SCHEMES = {"http", "https"}
+
+def _safe_redirect_url(url: str) -> str | None:
+    """Return url only if scheme is http/https; else None."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in _SAFE_SCHEMES:
+            return None
+        # Block unset/empty netloc (e.g. "http:///path")
+        if not parsed.netloc:
+            return None
+        return url
+    except Exception:
+        return None
+
+# All email management endpoints require an authenticated admin.
+router = APIRouter(prefix="/api/email", tags=["email"], dependencies=[Depends(require_admin)])
+
+# Open/click tracking is hit by recipients' mail clients — must stay public.
+public_router = APIRouter(prefix="/api/email", tags=["email-tracking"])
 
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
 SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "info@pashx.com")
@@ -136,7 +159,7 @@ def inject_tracking(html_body: str, campaign_id: str, contact_email: str) -> str
         original_url = match.group(1)
         if "track/open" in original_url or "track/click" in original_url:
             return match.group(0)
-        tracked = f'{BACKEND_URL}/api/email/track/click/{campaign_id}?email={contact_email}&url={original_url}'
+        tracked = f'{BACKEND_URL}/api/email/track/click/{campaign_id}?email={quote(contact_email, safe="")}&url={quote(original_url, safe="")}'
         return f'href="{tracked}"'
 
     html_body = re.sub(r'href="([^"]+)"', replace_link, html_body)
@@ -365,7 +388,7 @@ TRACKING_PIXEL = bytes([
     0x01, 0x00, 0x3B,
 ])
 
-@router.get("/track/open/{email_log_id}")
+@public_router.get("/track/open/{email_log_id}")
 async def track_open(email_log_id: str, email: str = ""):
     """Track email open via invisible pixel"""
     db = get_db()
@@ -388,7 +411,7 @@ async def track_open(email_log_id: str, email: str = ""):
         logger.error(f"Track open error: {e}")
     return Response(content=TRACKING_PIXEL, media_type="image/gif")
 
-@router.get("/track/click/{email_log_id}")
+@public_router.get("/track/click/{email_log_id}")
 async def track_click(email_log_id: str, email: str = "", url: str = ""):
     """Track email click and redirect"""
     db = get_db()
@@ -411,8 +434,9 @@ async def track_click(email_log_id: str, email: str = "", url: str = ""):
     except Exception as e:
         logger.error(f"Track click error: {e}")
 
-    if url:
-        return RedirectResponse(url=url)
+    safe_url = _safe_redirect_url(url)
+    if safe_url:
+        return RedirectResponse(url=safe_url)
     return {"tracked": True}
 
 # ==================== LOGS & ACTIVITY ====================
@@ -463,7 +487,8 @@ async def get_email_stats():
     db = get_db()
 
     total = await db.db.email_logs.count_documents({})
-    sent = await db.db.email_logs.count_documents({"status": "sent"})
+    # Count all emails that reached SendGrid (sent_at set), regardless of later status changes
+    sent = await db.db.email_logs.count_documents({"sent_at": {"$ne": None}})
     failed = await db.db.email_logs.count_documents({"status": "failed"})
     opened = await db.db.email_logs.count_documents({"opened_at": {"$ne": None}})
     clicked = await db.db.email_logs.count_documents({"clicked_at": {"$ne": None}})

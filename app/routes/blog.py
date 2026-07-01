@@ -1,11 +1,52 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from bson import ObjectId
 import re
+import nh3
+from app.middleware.auth import require_admin
 
 router = APIRouter(prefix="/api/blogs", tags=["blog"])
+
+# ==================== SANITIZATION ====================
+
+# Tags/attributes allowed in user-authored blog HTML. Everything else is stripped.
+_ALLOWED_TAGS = {
+    "p", "br", "hr", "span", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+    "ul", "ol", "li", "blockquote", "pre", "code", "strong", "em", "b", "i",
+    "u", "s", "a", "img", "figure", "figcaption", "table", "thead", "tbody",
+    "tr", "th", "td", "caption", "small", "sub", "sup",
+}
+_ALLOWED_ATTRS = {
+    "*": {"class", "id", "style"},
+    "a": {"href", "title", "target"},
+    "img": {"src", "alt", "title", "width", "height", "loading"},
+}
+
+
+def sanitize_html(html: str) -> str:
+    """Strip script/event-handler/dangerous markup from user-authored HTML."""
+    if not html:
+        return html
+    return nh3.clean(
+        html,
+        tags=_ALLOWED_TAGS,
+        attributes=_ALLOWED_ATTRS,
+        url_schemes={"http", "https", "mailto", "tel"},
+        link_rel="noopener noreferrer nofollow",
+    )
+
+
+def sanitize_css(css: str) -> str:
+    """Prevent <style> breakout and JS execution from user-authored CSS."""
+    if not css:
+        return css
+    # Block tag-injection breakout and known CSS exec vectors.
+    css = re.sub(r"</?\s*(style|script)[^>]*>", "", css, flags=re.IGNORECASE)
+    css = css.replace("<", "").replace(">", "")
+    css = re.sub(r"(javascript:|expression\s*\(|@import|behavior\s*:)", "", css, flags=re.IGNORECASE)
+    return css
 
 # ==================== MODELS ====================
 
@@ -125,7 +166,7 @@ async def get_blog_by_slug(slug: str):
 # ==================== ADMIN ENDPOINTS ====================
 
 @router.get("/admin/all")
-async def get_all_blogs_admin():
+async def get_all_blogs_admin(user=Depends(require_admin)):
     """Get all blogs including drafts (for admin dashboard)"""
     from app.config import database
 
@@ -161,9 +202,13 @@ async def get_all_blogs_admin():
     }
 
 @router.post("/")
-async def create_blog(blog: BlogCreate):
+async def create_blog(blog: BlogCreate, user=Depends(require_admin)):
     """Create new blog post"""
     from app.config import database
+
+    # Sanitize user-authored HTML/CSS before persisting (stored-XSS guard)
+    blog.custom_html = sanitize_html(blog.custom_html or "")
+    blog.custom_css = sanitize_css(blog.custom_css or "")
 
     slug = generate_slug(blog.title)
 
@@ -201,7 +246,7 @@ async def create_blog(blog: BlogCreate):
     }
 
 @router.put("/{blog_id}")
-async def update_blog(blog_id: str, updates: BlogUpdate):
+async def update_blog(blog_id: str, updates: BlogUpdate, user=Depends(require_admin)):
     """Update blog post"""
     from app.config import database
 
@@ -209,6 +254,12 @@ async def update_blog(blog_id: str, updates: BlogUpdate):
         obj_id = ObjectId(blog_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid blog ID")
+
+    # Sanitize user-authored HTML/CSS before persisting (stored-XSS guard)
+    if updates.custom_html is not None:
+        updates.custom_html = sanitize_html(updates.custom_html)
+    if updates.custom_css is not None:
+        updates.custom_css = sanitize_css(updates.custom_css)
 
     update_data = {k: v for k, v in updates.dict().items() if v is not None}
 
@@ -245,7 +296,7 @@ async def update_blog(blog_id: str, updates: BlogUpdate):
     return {"success": True, "message": "Blog updated"}
 
 @router.patch("/{blog_id}/publish")
-async def toggle_publish(blog_id: str):
+async def toggle_publish(blog_id: str, user=Depends(require_admin)):
     """Toggle publish/unpublish status"""
     from app.config import database
 
@@ -268,7 +319,7 @@ async def toggle_publish(blog_id: str):
     return {"success": True, "status": new_status}
 
 @router.delete("/{blog_id}")
-async def delete_blog(blog_id: str):
+async def delete_blog(blog_id: str, user=Depends(require_admin)):
     """Delete blog post"""
     from app.config import database
 

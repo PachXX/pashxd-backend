@@ -329,6 +329,10 @@ async def update_deal(deal_id: str, updates: DealUpdate, user=Depends(get_curren
     update_data = {k: v for k, v in updates.dict().items() if v is not None}
     update_data["updated_at"] = datetime.utcnow()
 
+    # Track exact timestamp when deal moves to won (for accurate revenue trending)
+    if update_data.get("stage") == "won" and old_deal.get("stage") != "won":
+        update_data["won_at"] = datetime.utcnow()
+
     result = await database.db.deals.update_one(
         {"_id": obj_id},
         {"$set": update_data}
@@ -444,4 +448,122 @@ async def create_activity(activity: ActivityCreate, user=Depends(get_current_use
         "id": str(result.inserted_id),
         **activity.dict(),
         "created_at": activity_doc["created_at"].isoformat(),
+    }
+
+
+# ==================== DASHBOARD STATS ====================
+
+@router.get("/stats")
+async def get_dashboard_stats(days: int = 30, user=Depends(get_current_user)):
+    """
+    Single aggregated endpoint for the Overview dashboard.
+    Returns contacts, deals, revenue, and pre-bucketed trend data.
+    """
+    from app.config import database
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_month_start = (month_start - timedelta(days=1)).replace(day=1)
+
+    # Fetch all deals and contacts in parallel
+    all_deals = await database.db.deals.find({}).to_list(10000)
+    all_contacts = await database.db.contacts.find({}, {"created_at": 1}).to_list(10000)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    activities_today = await database.db.activities.count_documents({"created_at": {"$gte": today_start}})
+
+    # ── Contacts ──────────────────────────────────────────────
+    total_contacts = len(all_contacts)
+    contacts_this_month = sum(
+        1 for c in all_contacts
+        if isinstance(c.get("created_at"), datetime) and c["created_at"] >= month_start
+    )
+    contacts_last_month = sum(
+        1 for c in all_contacts
+        if isinstance(c.get("created_at"), datetime)
+        and last_month_start <= c["created_at"] < month_start
+    )
+
+    # ── Deals ─────────────────────────────────────────────────
+    won_deals = [d for d in all_deals if d.get("stage") == "won"]
+    lost_deals = [d for d in all_deals if d.get("stage") == "lost"]
+    active_deals = [d for d in all_deals if d.get("stage") not in ("won", "lost")]
+
+    by_stage = {}
+    for d in all_deals:
+        s = d.get("stage", "lead")
+        by_stage[s] = by_stage.get(s, 0) + 1
+
+    closed_count = len(won_deals) + len(lost_deals)
+    win_rate = round(len(won_deals) / closed_count * 100) if closed_count > 0 else 0
+
+    # ── Revenue ───────────────────────────────────────────────
+    def deal_value(d):
+        return float(d.get("value") or 0)
+
+    def won_date(d):
+        """Best timestamp for when deal was won."""
+        return d.get("won_at") or d.get("updated_at") or d.get("created_at")
+
+    total_revenue = sum(deal_value(d) for d in won_deals)
+    pipeline_value = sum(deal_value(d) for d in active_deals)
+
+    revenue_this_month = sum(
+        deal_value(d) for d in won_deals
+        if isinstance(won_date(d), datetime) and won_date(d) >= month_start
+    )
+    revenue_last_month = sum(
+        deal_value(d) for d in won_deals
+        if isinstance(won_date(d), datetime)
+        and last_month_start <= won_date(d) < month_start
+    )
+
+    avg_deal_value = round(total_revenue / len(won_deals)) if won_deals else 0
+
+    # ── Revenue trend (N days, pre-bucketed) ──────────────────
+    window_start = now - timedelta(days=days)
+    trend = []
+    for i in range(days):
+        day = window_start + timedelta(days=i)
+        day_key = day.date()
+        value = sum(
+            deal_value(d) for d in won_deals
+            if isinstance(won_date(d), datetime) and won_date(d).date() == day_key
+        )
+        trend.append({"date": day_key.isoformat(), "value": value})
+
+    # ── MoM deltas ────────────────────────────────────────────
+    def pct_change(curr, prev):
+        if prev == 0:
+            return None  # can't compute — insufficient history
+        return round((curr - prev) / prev * 100, 1)
+
+    return {
+        "contacts": {
+            "total": total_contacts,
+            "this_month": contacts_this_month,
+            "last_month": contacts_last_month,
+            "mom_pct": pct_change(contacts_this_month, contacts_last_month),
+        },
+        "deals": {
+            "total": len(all_deals),
+            "active": len(active_deals),
+            "won": len(won_deals),
+            "lost": len(lost_deals),
+            "by_stage": by_stage,
+            "closing_soon": sum(1 for d in active_deals if d.get("stage") in ("negotiation", "proposal")),
+        },
+        "revenue": {
+            "total": total_revenue,
+            "this_month": revenue_this_month,
+            "last_month": revenue_last_month,
+            "pipeline": pipeline_value,
+            "avg_deal": avg_deal_value,
+            "mom_pct": pct_change(revenue_this_month, revenue_last_month),
+        },
+        "activities": {
+            "today": activities_today,
+        },
+        "win_rate": win_rate,
+        "trend": trend,
     }

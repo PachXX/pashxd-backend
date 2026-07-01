@@ -1,5 +1,6 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from app.middleware.auth import require_admin
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -258,8 +259,8 @@ async def create_demo(input: DemoRequestCreate):
     return demo_obj
 
 @api_router.get("/demo-requests")
-async def get_demo_requests():
-    """Get all demo requests"""
+async def get_demo_requests(user=Depends(require_admin)):
+    """Get all demo requests (admin only)"""
     requests = await db_instance.demo_requests.find({}, {"_id": 0}).to_list(1000)
 
     for req in requests:
@@ -299,12 +300,21 @@ route_modules = [
     "app.routes.email",  # ← EMAIL ROUTE
     "app.routes.seo",
     "app.routes.dashboard",
+    "app.routes.agents",
 ]
 
 for route_path in route_modules:
     router = safe_import_router(route_path)
     if router:
         app.include_router(router)
+
+# Email open/click tracking must stay public (hit by mail clients, not the admin)
+try:
+    public_email_router = safe_import_router("app.routes.email", name="public_router")
+    if public_email_router:
+        app.include_router(public_email_router)
+except Exception as e:
+    logger.error(f"❌ Email tracking router include failed: {e}")
 
 # Try insights route (may be in different locations)
 for insights_path in ["app.api.routes.insights", "app.routes.insights"]:

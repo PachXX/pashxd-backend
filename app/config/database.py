@@ -4,7 +4,7 @@ import os
 
 load_dotenv()
 
-MONGODB_URL = os.getenv("MONGODB_URL")
+MONGODB_URL = os.getenv("MONGODB_URL") or os.getenv("MONGO_URL")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "pashxd")
 
 client: AsyncIOMotorClient = None
