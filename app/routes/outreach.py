@@ -319,6 +319,10 @@ async def approve_draft(draft_id: str, user=Depends(require_admin)):
         {"_id": draft["_id"]}, {"$set": {"status": "sent", "sent_at": _now()}}
     )
     await _advance(db, draft)
+    # write outreach state back onto the CRM contact
+    seq = await db.db.outreach_sequences.find_one({"_id": _oid(draft["sequence_id"])})
+    if seq:
+        await _sync_contact(db, seq)
     return {"ok": True}
 
 
@@ -335,6 +339,43 @@ async def skip_draft(draft_id: str, user=Depends(require_admin)):
     await db.db.outreach_drafts.update_one({"_id": draft["_id"]}, {"$set": {"status": "skipped"}})
     await _advance(db, draft)
     return {"ok": True}
+
+
+@router.get("/sent")
+async def list_sent(limit: int = 50, user=Depends(get_current_user)):
+    """Recently sent outreach emails, enriched with each sequence's next follow-up."""
+    from app.config import database
+    db = database
+    limit = max(1, min(limit, 200))
+    sent = await db.db.outreach_drafts.find({"status": "sent"}).sort("sent_at", -1).to_list(limit)
+
+    seq_ids = list({d.get("sequence_id") for d in sent if d.get("sequence_id")})
+    seq_map = {}
+    for sid in seq_ids:
+        try:
+            s = await db.db.outreach_sequences.find_one({"_id": _oid(sid)})
+            if s:
+                seq_map[sid] = s
+        except Exception:
+            continue
+
+    items = []
+    for d in sent:
+        s = seq_map.get(d.get("sequence_id"), {})
+        seq_status = s.get("status")
+        items.append({
+            "id": _sid(d),
+            "contact_name": d.get("contact_name"),
+            "contact_email": d.get("contact_email"),
+            "company": d.get("company"),
+            "step": d.get("step"),
+            "kind": d.get("kind"),
+            "subject": d.get("subject"),
+            "sent_at": d.get("sent_at"),
+            "sequence_status": seq_status,
+            "next_followup_at": s.get("next_due_at") if seq_status == "active" else None,
+        })
+    return {"sent": items}
 
 
 @router.post("/reset")
@@ -389,6 +430,41 @@ def _oid(id_str: str):
         return ObjectId(id_str)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid id")
+
+
+TOUCH_LABELS = ["intro", "follow-up 1", "follow-up 2", "breakup"]
+
+
+async def _sync_contact(db, seq: dict):
+    """Mirror sequence state onto the CRM contact so the pipeline shows outreach status."""
+    cid = seq.get("contact_id")
+    if not cid:
+        return
+    status = seq.get("status")
+    touches_sent = seq.get("current_step", 0)  # after advance, == number of touches sent
+    next_due = seq.get("next_due_at") if status == "active" else None
+    if status == "completed":
+        summary = f"Outreach complete — {touches_sent} email(s) sent, no next follow-up"
+    elif status == "hot":
+        summary = "Outreach paused — lead engaged (hot), handle personally"
+    else:
+        last = TOUCH_LABELS[min(touches_sent - 1, len(TOUCH_LABELS) - 1)] if touches_sent > 0 else "intro"
+        due_str = next_due.strftime("%Y-%m-%d") if hasattr(next_due, "strftime") else str(next_due)[:10]
+        summary = f"Outreach: {last} sent · next follow-up {due_str}"
+    try:
+        await db.db.contacts.update_one(
+            {"_id": _oid(cid)},
+            {"$set": {
+                "outreach_status": status,
+                "outreach_touches_sent": touches_sent,
+                "outreach_last_sent_at": seq.get("last_sent_at"),
+                "outreach_next_followup_at": next_due,
+                "outreach_summary": summary,
+                "updated_at": _now(),
+            }},
+        )
+    except Exception:
+        pass
 
 
 async def _advance(db, draft: dict):

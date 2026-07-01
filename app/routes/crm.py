@@ -89,6 +89,10 @@ async def get_contacts(search: Optional[str] = None, status: Optional[str] = Non
                 "source": c.get("source", "manual"),
                 "status": c.get("status", "new"),
                 "notes": c.get("notes", ""),
+                "outreach_status": c.get("outreach_status"),
+                "outreach_summary": c.get("outreach_summary"),
+                "outreach_next_followup_at": c.get("outreach_next_followup_at").isoformat() if isinstance(c.get("outreach_next_followup_at"), datetime) else c.get("outreach_next_followup_at"),
+                "outreach_last_sent_at": c.get("outreach_last_sent_at").isoformat() if isinstance(c.get("outreach_last_sent_at"), datetime) else c.get("outreach_last_sent_at"),
                 "created_at": c.get("created_at", datetime.utcnow()).isoformat() if isinstance(c.get("created_at"), datetime) else c.get("created_at"),
                 "updated_at": c.get("updated_at", datetime.utcnow()).isoformat() if isinstance(c.get("updated_at"), datetime) else c.get("updated_at"),
             }
@@ -153,6 +157,11 @@ async def get_contact(contact_id: str, user=Depends(get_current_user)):
         "source": contact.get("source", "manual"),
         "status": contact.get("status", "new"),
         "notes": contact.get("notes", ""),
+        "outreach_status": contact.get("outreach_status"),
+        "outreach_summary": contact.get("outreach_summary"),
+        "outreach_touches_sent": contact.get("outreach_touches_sent"),
+        "outreach_next_followup_at": contact.get("outreach_next_followup_at").isoformat() if isinstance(contact.get("outreach_next_followup_at"), datetime) else contact.get("outreach_next_followup_at"),
+        "outreach_last_sent_at": contact.get("outreach_last_sent_at").isoformat() if isinstance(contact.get("outreach_last_sent_at"), datetime) else contact.get("outreach_last_sent_at"),
         "created_at": contact.get("created_at", datetime.utcnow()).isoformat() if isinstance(contact.get("created_at"), datetime) else contact.get("created_at"),
         "updated_at": contact.get("updated_at", datetime.utcnow()).isoformat() if isinstance(contact.get("updated_at"), datetime) else contact.get("updated_at"),
     }
