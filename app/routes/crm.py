@@ -253,8 +253,27 @@ async def get_pipeline(user=Depends(get_current_user)):
         "lost": [],
     }
 
+    # Batch-fetch every referenced contact in ONE query. The previous
+    # per-deal find_one was an N+1 that took ~21s at 125 deals on Render.
+    contact_oids = []
+    for d in deals:
+        cid = d.get("contact_id")
+        if cid:
+            try:
+                contact_oids.append(ObjectId(cid))
+            except Exception:
+                pass
+    contacts_by_id = {}
+    if contact_oids:
+        cursor = database.db.contacts.find(
+            {"_id": {"$in": contact_oids}},
+            {"name": 1, "email": 1, "company": 1},
+        )
+        async for c in cursor:
+            contacts_by_id[str(c["_id"])] = c
+
     for deal in deals:
-        contact = await database.db.contacts.find_one({"_id": ObjectId(deal["contact_id"])})
+        contact = contacts_by_id.get(str(deal.get("contact_id", "")))
 
         deal_data = {
             "id": str(deal["_id"]),
@@ -475,11 +494,14 @@ async def get_dashboard_stats(days: int = 30, user=Depends(get_current_user)):
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     last_month_start = (month_start - timedelta(days=1)).replace(day=1)
 
-    # Fetch all deals and contacts in parallel
-    all_deals = await database.db.deals.find({}).to_list(10000)
-    all_contacts = await database.db.contacts.find({}, {"created_at": 1}).to_list(10000)
+    # Fetch deals, contacts, and today's activity count concurrently
+    import asyncio
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    activities_today = await database.db.activities.count_documents({"created_at": {"$gte": today_start}})
+    all_deals, all_contacts, activities_today = await asyncio.gather(
+        database.db.deals.find({}).to_list(10000),
+        database.db.contacts.find({}, {"created_at": 1}).to_list(10000),
+        database.db.activities.count_documents({"created_at": {"$gte": today_start}}),
+    )
 
     # ── Contacts ──────────────────────────────────────────────
     total_contacts = len(all_contacts)
