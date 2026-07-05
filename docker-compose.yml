@@ -1,0 +1,60 @@
+# Local development stack: API + MongoDB + Firebase emulators.
+#
+#   docker compose up --build
+#
+# API:                http://localhost:8080   (health: /health, /health/ready)
+# MongoDB:            mongodb://localhost:27017
+# Firebase Auth:      http://localhost:9099   (project: demo-pashxd)
+# Firestore emulator: http://localhost:8081
+#
+# In restricted networks override the base images, e.g.:
+#   PYTHON_IMAGE=mirror.gcr.io/library/python:3.11-slim \
+#   MONGO_IMAGE=mirror.gcr.io/library/mongo:7 docker compose up --build
+
+services:
+  api:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
+    ports:
+      - "8080:8080"
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: pashxd
+      JWT_SECRET: local-dev-secret-change-me
+      ADMIN_EMAIL: admin@pashx.com
+      ADMIN_PASSWORD: changeme123
+      FIREBASE_PROJECT_ID: demo-pashxd
+      FIREBASE_AUTH_EMULATOR_HOST: firebase:9099
+      FIRESTORE_EMULATOR_HOST: firebase:8081
+      BACKEND_URL: http://localhost:8080
+    depends_on:
+      - mongo
+      - firebase
+
+  mongo:
+    image: ${MONGO_IMAGE:-mongo:7}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  firebase:
+    image: ${NODE_IMAGE:-node:20-slim}
+    working_dir: /app
+    # openjdk needed by the Firestore emulator; auth emulator is pure Node.
+    command: >
+      sh -c "apt-get update -qq && apt-get install -y -qq default-jre-headless >/dev/null &&
+             npm i -g firebase-tools --silent &&
+             firebase emulators:start --only auth,firestore --project demo-pashxd"
+    ports:
+      - "9099:9099"
+      - "8081:8081"
+    volumes:
+      - ./firebase.json:/app/firebase.json:ro
+      - ./firestore.rules:/app/firestore.rules:ro
+      - ./firestore.indexes.json:/app/firestore.indexes.json:ro
+
+volumes:
+  mongo-data:

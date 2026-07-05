@@ -144,6 +144,32 @@ BASE_URL=http://localhost:8080 TEST_ADMIN_EMAIL=admin@pashx.com \
   TEST_ADMIN_PASSWORD=devpass pytest tests/ -v
 ```
 
+## Local development (Firebase Emulator Suite)
+
+The full stack — API, MongoDB, and Firebase Auth/Firestore emulators —
+runs locally with one command:
+
+```bash
+docker compose up --build
+```
+
+Or run the emulators directly (`npm i -g firebase-tools`):
+
+```bash
+firebase emulators:start --only auth,firestore --project demo-pashxd
+```
+
+Point the API at them with `FIREBASE_PROJECT_ID=demo-pashxd` and
+`FIREBASE_AUTH_EMULATOR_HOST=localhost:9099`. The Firebase auth tests
+(`tests/test_firebase_auth.py`) create emulator users (with and without
+the `role=admin` claim) and assert the API's token verification and
+role enforcement:
+
+```bash
+BASE_URL=http://localhost:8080 FIREBASE_AUTH_EMULATOR_URL=http://localhost:9099 \
+  pytest tests/test_firebase_auth.py -v
+```
+
 ## Deployment checklist
 
 - [ ] `setup-gcp.sh` run; billing linked; all APIs enabled
