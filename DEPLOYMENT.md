@@ -192,6 +192,26 @@ BASE_URL=http://localhost:8080 FIREBASE_AUTH_EMULATOR_URL=http://localhost:9099 
 - [ ] Cloud Build trigger created for CI/CD
 - [ ] Render service **suspended** (not deleted) until soak period ends
 
+## Troubleshooting (issues hit during real deployment)
+
+* **`firebase deploy --only ...storage` fails: "Firebase Storage has not
+  been set up on project ..."** — Storage requires choosing the default
+  bucket's location once via the Firebase console (Storage → Get
+  Started); it can't be done from the CLI. Since the backend doesn't
+  use Storage yet, just drop it from the target list:
+  `firebase deploy --only firestore:rules,firestore:indexes --project pashxd-e56c5`.
+  Add `,storage` back once you've clicked through the console setup.
+* **`gcloud builds submit` fails with a "Regional Access Boundary" /
+  "Account not found" error and "forbidden from accessing the bucket
+  [PROJECT_ID_cloudbuild]"** — this is Cloud Build's automatic
+  first-use staging bucket creation hitting a permission or resource-
+  location policy wall. Work around it by creating the bucket yourself
+  and pointing `deploy.sh` at it:
+  ```bash
+  gsutil mb -l "$REGION" "gs://${PROJECT_ID}-cloudbuild-source"
+  GCS_STAGING_BUCKET="gs://${PROJECT_ID}-cloudbuild-source" ./scripts/deploy.sh
+  ```
+
 ## Rollback plan
 
 1. **Fast rollback (bad revision)** — Cloud Run keeps every revision:

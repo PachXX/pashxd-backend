@@ -7,7 +7,11 @@ substitutions:
   _REGION: europe-west1
   _REPO_NAME: pashxd
   _SERVICE_NAME: pashxd-api
-  _RUNTIME_SA: pashxd-api-runtime@${PROJECT_ID}.iam.gserviceaccount.com
+  # Service account NAME only -- Cloud Build does not recursively expand
+  # ${PROJECT_ID} inside another substitution's default value, so the
+  # full email is built inline at the point of use (deploy step args)
+  # instead of being pre-assembled here.
+  _RUNTIME_SA_NAME: pashxd-api-runtime
 
 steps:
   - id: build
@@ -36,7 +40,7 @@ steps:
       - ${_SERVICE_NAME}
       - --region=${_REGION}
       - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${SHORT_SHA}
-      - --service-account=${_RUNTIME_SA}
+      - --service-account=${_RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
 
 images:
   - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${SHORT_SHA}

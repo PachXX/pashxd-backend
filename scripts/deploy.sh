@@ -18,7 +18,17 @@ FIREBASE_STORAGE_BUCKET="${FIREBASE_STORAGE_BUCKET:-${PROJECT_ID}.firebasestorag
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${SERVICE_NAME}:$(git rev-parse --short HEAD)"
 
 echo "── Building image with Cloud Build: ${IMAGE}"
-gcloud builds submit --project "$PROJECT_ID" --tag "$IMAGE" .
+# Cloud Build normally auto-creates a default staging bucket
+# (${PROJECT_ID}_cloudbuild) on first use. Some accounts/orgs hit a
+# permission or resource-location policy wall on that auto-create path;
+# set GCS_STAGING_BUCKET to a bucket you create yourself to bypass it,
+# e.g.: gsutil mb -l "$REGION" "gs://${PROJECT_ID}-cloudbuild-source"
+if [ -n "${GCS_STAGING_BUCKET:-}" ]; then
+  gcloud builds submit --project "$PROJECT_ID" --tag "$IMAGE" \
+    --gcs-source-staging-bucket="$GCS_STAGING_BUCKET" .
+else
+  gcloud builds submit --project "$PROJECT_ID" --tag "$IMAGE" .
+fi
 
 echo "── Deploying to Cloud Run: ${SERVICE_NAME} (${REGION})"
 gcloud run deploy "$SERVICE_NAME" \

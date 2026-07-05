@@ -30,8 +30,10 @@ services:
       FIRESTORE_EMULATOR_HOST: firebase:8081
       BACKEND_URL: http://localhost:8080
     depends_on:
-      - mongo
-      - firebase
+      mongo:
+        condition: service_healthy
+      firebase:
+        condition: service_healthy
 
   mongo:
     image: ${MONGO_IMAGE:-mongo:7}
@@ -39,13 +41,18 @@ services:
       - "27017:27017"
     volumes:
       - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand('ping')"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
   firebase:
     image: ${NODE_IMAGE:-node:20-slim}
     working_dir: /app
     # openjdk needed by the Firestore emulator; auth emulator is pure Node.
     command: >
-      sh -c "apt-get update -qq && apt-get install -y -qq default-jre-headless >/dev/null &&
+      sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends default-jre-headless curl >/dev/null &&
              npm i -g firebase-tools --silent &&
              firebase emulators:start --only auth,firestore --project demo-pashxd"
     ports:
@@ -55,6 +62,14 @@ services:
       - ./firebase.json:/app/firebase.json:ro
       - ./firestore.rules:/app/firestore.rules:ro
       - ./firestore.indexes.json:/app/firestore.indexes.json:ro
+    healthcheck:
+      # First run installs JRE + firebase-tools (~30-60s) before the
+      # emulator can even start, so allow a long startup grace period.
+      test: ["CMD", "curl", "-sf", "http://localhost:9099"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
 
 volumes:
   mongo-data:
