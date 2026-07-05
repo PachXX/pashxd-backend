@@ -25,7 +25,7 @@ echo "── Building image with Cloud Build: ${IMAGE}"
 # e.g.: gsutil mb -l "$REGION" "gs://${PROJECT_ID}-cloudbuild-source"
 if [ -n "${GCS_STAGING_BUCKET:-}" ]; then
   gcloud builds submit --project "$PROJECT_ID" --tag "$IMAGE" \
-    --gcs-source-staging-bucket="$GCS_STAGING_BUCKET" .
+    --gcs-source-staging-dir="$GCS_STAGING_BUCKET" .
 else
   gcloud builds submit --project "$PROJECT_ID" --tag "$IMAGE" .
 fi
