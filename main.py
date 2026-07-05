@@ -19,18 +19,22 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 # ─── LOGGING ──────────────────────────────────────────────
+# Structured JSON logging on Cloud Run; plain text locally (LOG_FORMAT=text).
+from app.config.logging_config import configure_logging  # noqa: E402
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # ─── DATABASE ─────────────────────────────────────────────
 
-mongo_url = os.getenv("MONGO_URL")
+mongo_url = os.getenv("MONGO_URL") or os.getenv("MONGODB_URL")
 if not mongo_url:
-    logger.warning("⚠️ MONGO_URL not set, using default")
+    logger.warning("⚠️ MONGO_URL not set, using default localhost")
     mongo_url = "mongodb://localhost:27017"
 
-client = AsyncIOMotorClient(mongo_url)
+# serverSelectionTimeoutMS keeps startup from hanging on an unreachable DB —
+# operations fail fast and loud so Cloud Run surfaces the error in logs.
+client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
 db_name = os.getenv("DB_NAME", "pashxd")
 db_instance = client[db_name]
 

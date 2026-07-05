@@ -1,0 +1,12 @@
+rules_version = '2';
+
+// Deny all direct client access by default. The backend accesses Storage via
+// the Admin SDK (service account), which bypasses these rules. Loosen only for
+// specific, authenticated client paths if/when the frontend uploads directly.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,63 @@
+# Cloud Build → Artifact Registry → Cloud Run.
+# Trigger:  gcloud builds submit --config cloudbuild.yaml \
+#             --substitutions=_REGION=europe-west1,_SERVICE=pashxd-backend,_REPO=pashxd
+#
+# Requires: Artifact Registry repo (_REPO) and Cloud Run service to exist, and
+# the Cloud Build service account to have roles/run.admin + roles/iam.serviceAccountUser.
+substitutions:
+  _REGION: europe-west1
+  _SERVICE: pashxd-backend
+  _REPO: pashxd
+  _RUNTIME_SA: pashxd-backend-run  # runtime service account (short name)
+
+steps:
+  # 1. Build the image, tagging with the commit SHA and :latest.
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - .
+
+  # 2. Push both tags.
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}
+
+  # 3. Deploy to Cloud Run. Secrets come from Secret Manager; non-secret config
+  #    is set as plain env vars. Adjust --set-secrets to match your secret names.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --service-account=${_RUNTIME_SA}@$PROJECT_ID.iam.gserviceaccount.com
+      - --allow-unauthenticated
+      - --port=8080
+      - --cpu=1
+      - --memory=512Mi
+      - --min-instances=0
+      - --max-instances=10
+      - --timeout=300
+      - --set-env-vars=DB_NAME=pashxd,JWT_ALGORITHM=HS256,JWT_EXPIRE_HOURS=24,FRONTEND_URL=https://pashx.com,ADMIN_URL=https://admin.pashx.com,SENDGRID_FROM_EMAIL=info@pashx.com,SENDGRID_FROM_NAME=PashxD,LOG_FORMAT=json,GOOGLE_CLOUD_PROJECT=$PROJECT_ID
+      - --set-secrets=MONGO_URL=MONGO_URL:latest,JWT_SECRET=JWT_SECRET:latest,ADMIN_EMAIL=ADMIN_EMAIL:latest,ADMIN_PASSWORD=ADMIN_PASSWORD:latest,SENDGRID_API_KEY=SENDGRID_API_KEY:latest,CORS_ORIGINS=CORS_ORIGINS:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1200s

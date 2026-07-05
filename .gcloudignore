@@ -1,0 +1,20 @@
+# Files not uploaded to Cloud Build. Mirrors .dockerignore.
+# Note: .gcloudignore disables gcloud's default .gitignore parsing, so we
+# re-list everything we want excluded here explicitly.
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.env
+.env.*
+node_modules
+data
+graphify_output.json
+.idea
+.vscode
+.DS_Store
+render.yaml

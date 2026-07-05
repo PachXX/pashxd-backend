@@ -65,3 +65,8 @@ websockets==16.0
 httpx==0.27.0
 
 nh3>=0.2.18
+
+# ─── Google Cloud / Firebase ─────────────────────────────
+# Optional Firebase Auth (ID-token verification) via the Admin SDK.
+# Uses Application Default Credentials on Cloud Run — no key file shipped.
+firebase-admin==6.5.0
