@@ -18,10 +18,22 @@ from bson import ObjectId
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-# ─── LOGGING ──────────────────────────────────────────────
+# ─── LOGGING (JSON on Cloud Run, plain locally) ──────────
 
-logging.basicConfig(level=logging.INFO)
+from app.utils.cloud_logging import setup_logging, running_on_cloud_run
+
+setup_logging()
 logger = logging.getLogger(__name__)
+
+# ─── PRODUCTION GUARDS ───────────────────────────────────
+
+if running_on_cloud_run():
+    _missing = [v for v in ("MONGO_URL", "JWT_SECRET") if not os.getenv(v)]
+    if _missing:
+        raise RuntimeError(
+            f"Refusing to start on Cloud Run without: {', '.join(_missing)}. "
+            "Configure them via Secret Manager (--set-secrets) on the service."
+        )
 
 # ─── DATABASE ─────────────────────────────────────────────
 
@@ -39,6 +51,13 @@ db_instance = client[db_name]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """App startup and shutdown"""
+    # Firebase Admin SDK (optional — app runs fine without it)
+    try:
+        from app.config.firebase import init_firebase
+        init_firebase()
+    except Exception as e:
+        logger.warning(f"⚠️ Firebase init skipped: {e}")
+
     try:
         from app.config import database
         database.db = db_instance
@@ -73,8 +92,16 @@ async def seed_admin():
     """Create default admin user if not exists"""
     from app.utils.hash import hash_password
 
-    admin_email = os.getenv("ADMIN_EMAIL", "admin@pashx.com")
-    admin_password = os.getenv("ADMIN_PASSWORD", "changeme123")
+    admin_email = os.getenv("ADMIN_EMAIL")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+
+    if not admin_email or not admin_password:
+        # Never seed a well-known default credential in production.
+        if running_on_cloud_run():
+            logger.info("ℹ️ Admin seed skipped (ADMIN_EMAIL/ADMIN_PASSWORD not set)")
+            return
+        admin_email = admin_email or "admin@pashx.com"
+        admin_password = admin_password or "changeme123"
 
     existing = await db_instance.users.find_one({"email": admin_email})
     if not existing:
@@ -328,7 +355,21 @@ for insights_path in ["app.api.routes.insights", "app.routes.insights"]:
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
+    """Liveness check (Cloud Run startup/liveness probe)"""
     return {"status": "healthy", "service": "pashxd-api"}
+
+@app.get("/health/ready")
+async def readiness():
+    """Readiness check — verifies MongoDB connectivity"""
+    from fastapi.responses import JSONResponse
+    try:
+        await client.admin.command("ping")
+        return {"status": "ready", "database": "connected"}
+    except Exception as e:
+        logger.error(f"❌ Readiness check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "database": "disconnected"},
+        )
 
 logger.info("🚀 Application initialized")

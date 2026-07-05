@@ -1,0 +1,45 @@
+# CI/CD pipeline: build → push → deploy to Cloud Run.
+# Trigger this from a Cloud Build GitHub trigger on the main branch:
+#   gcloud builds triggers create github \
+#     --repo-owner=PachXX --repo-name=pashxd-backend \
+#     --branch-pattern='^main$' --build-config=cloudbuild.yaml
+substitutions:
+  _REGION: europe-west1
+  _REPO_NAME: pashxd
+  _SERVICE_NAME: pashxd-api
+  _RUNTIME_SA: pashxd-api-runtime@${PROJECT_ID}.iam.gserviceaccount.com
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${SHORT_SHA}
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:latest
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --region=${_REGION}
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${SHORT_SHA}
+      - --service-account=${_RUNTIME_SA}
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${SHORT_SHA}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
