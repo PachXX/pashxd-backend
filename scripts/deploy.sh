@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ── Build & deploy PashxD API to Cloud Run ───────────────────────────
 # Usage:
-#   PROJECT_ID=pashxd-prod REGION=europe-west1 ./scripts/deploy.sh
+#   PROJECT_ID=pashxd-e56c5 REGION=europe-west1 ./scripts/deploy.sh
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:?Set PROJECT_ID}"
@@ -11,6 +11,9 @@ SERVICE_NAME="${SERVICE_NAME:-pashxd-api}"
 RUNTIME_SA="${RUNTIME_SA:-pashxd-api-runtime@${PROJECT_ID}.iam.gserviceaccount.com}"
 FRONTEND_URL="${FRONTEND_URL:-https://pashx.com}"
 ADMIN_URL="${ADMIN_URL:-https://admin.pashx.com}"
+# Firebase project ID == GCP project ID; storage bucket follows the
+# standard Firebase naming convention unless overridden.
+FIREBASE_STORAGE_BUCKET="${FIREBASE_STORAGE_BUCKET:-${PROJECT_ID}.firebasestorage.app}"
 
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${SERVICE_NAME}:$(git rev-parse --short HEAD)"
 
@@ -31,7 +34,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --max-instances 10 \
   --concurrency 80 \
   --timeout 300 \
-  --set-env-vars "DB_NAME=pashxd,FRONTEND_URL=${FRONTEND_URL},ADMIN_URL=${ADMIN_URL},JWT_EXPIRE_HOURS=24,FIREBASE_PROJECT_ID=${PROJECT_ID}" \
+  --set-env-vars "DB_NAME=pashxd,FRONTEND_URL=${FRONTEND_URL},ADMIN_URL=${ADMIN_URL},JWT_EXPIRE_HOURS=24,FIREBASE_PROJECT_ID=${PROJECT_ID},FIREBASE_STORAGE_BUCKET=${FIREBASE_STORAGE_BUCKET}" \
   --set-secrets "MONGO_URL=pashxd-mongo-url:latest,JWT_SECRET=pashxd-jwt-secret:latest,SENDGRID_API_KEY=pashxd-sendgrid-api-key:latest,ADMIN_EMAIL=pashxd-admin-email:latest,ADMIN_PASSWORD=pashxd-admin-password:latest" \
   --startup-probe "httpGet.path=/health,initialDelaySeconds=5,periodSeconds=5,failureThreshold=6"
 

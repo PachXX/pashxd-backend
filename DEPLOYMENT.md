@@ -24,10 +24,15 @@ MongoDB Atlas (unchanged)      SendGrid (unchanged)
 ## One-time provisioning
 
 ```bash
-# 1. Provision GCP: project, APIs, Artifact Registry, service accounts,
+# 0. The Firebase project already exists: pashxd-e56c5 (created via the
+#    Firebase console, web app registered). Its backing GCP project ID
+#    is the same string — use that as PROJECT_ID below.
+
+# 1. Provision GCP: APIs, Artifact Registry, service accounts,
 #    IAM (least privilege), Secret Manager, Firestore.
-PROJECT_ID=pashxd-prod REGION=europe-west1 ./scripts/setup-gcp.sh
-# (add BILLING_ACCOUNT_ID=XXXXXX-XXXXXX-XXXXXX to link billing)
+PROJECT_ID=pashxd-e56c5 REGION=europe-west1 ./scripts/setup-gcp.sh
+# (add BILLING_ACCOUNT_ID=XXXXXX-XXXXXX-XXXXXX to link billing, if not
+#  already linked from the Firebase console)
 
 # 2. Add secret values
 printf '%s' 'mongodb+srv://...'        | gcloud secrets versions add pashxd-mongo-url --data-file=-
@@ -36,9 +41,9 @@ printf '%s' 'SG.xxxxx'                 | gcloud secrets versions add pashxd-send
 printf '%s' 'admin@pashx.com'          | gcloud secrets versions add pashxd-admin-email --data-file=-
 printf '%s' 'a-strong-admin-password'  | gcloud secrets versions add pashxd-admin-password --data-file=-
 
-# 3. Attach Firebase + deploy rules
-firebase projects:addfirebase pashxd-prod
-firebase deploy --only firestore:rules,firestore:indexes,storage --project pashxd-prod
+# 3. Deploy Firestore/Storage rules (Firebase is already attached to
+#    this project — no need to run `firebase projects:addfirebase`)
+firebase deploy --only firestore:rules,firestore:indexes,storage --project pashxd-e56c5
 # Console: Authentication → Sign-in method → enable Email/Password
 
 # 4. Allow Cloud Run egress in MongoDB Atlas
@@ -49,7 +54,7 @@ firebase deploy --only firestore:rules,firestore:indexes,storage --project pashx
 ## Deploy
 
 ```bash
-PROJECT_ID=pashxd-prod REGION=europe-west1 ./scripts/deploy.sh
+PROJECT_ID=pashxd-e56c5 REGION=europe-west1 ./scripts/deploy.sh
 ```
 
 Or set up continuous deployment from GitHub:
@@ -63,6 +68,9 @@ gcloud builds triggers create github \
 After the first deploy, point the frontend at the service:
 * Vercel → pashxd-frontend → Environment Variables →
   `VITE_API_URL=https://<cloud-run-service-url>` and redeploy.
+* The frontend's `VITE_FIREBASE_*` variables (see `pashxd-frontend/.env.example`)
+  point at the same `pashxd-e56c5` Firebase project and don't need to
+  change per-environment — they're the public web SDK config, not secrets.
 
 ### Custom domain (optional)
 
