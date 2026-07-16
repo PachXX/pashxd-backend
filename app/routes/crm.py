@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Literal
 from datetime import datetime
 from bson import ObjectId
 from app.middleware.auth import get_current_user
+from app.utils.audit import log_audit
 
 router = APIRouter(prefix="/api/crm", tags=["crm"])
 
@@ -166,8 +167,65 @@ async def get_contact(contact_id: str, user=Depends(get_current_user)):
         "updated_at": contact.get("updated_at", datetime.utcnow()).isoformat() if isinstance(contact.get("updated_at"), datetime) else contact.get("updated_at"),
     }
 
+@router.get("/contacts/{contact_id}/export")
+async def export_contact(contact_id: str, request: Request, user=Depends(get_current_user)):
+    """
+    GDPR Art. 15/20 — data subject access & portability. Returns the
+    complete record we hold on this contact (all fields, no summary
+    truncation) as a single downloadable JSON document. Admin-triggered:
+    the operator runs this on behalf of a data subject request, since
+    PashxD contacts don't have their own login to self-serve.
+    """
+    from app.config import database
+
+    try:
+        obj_id = ObjectId(contact_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid contact ID")
+
+    contact = await database.db.contacts.find_one({"_id": obj_id})
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    def _serialize(doc: dict) -> dict:
+        out = {}
+        for k, v in doc.items():
+            if k == "_id":
+                out["id"] = str(v)
+            elif isinstance(v, datetime):
+                out[k] = v.isoformat()
+            elif isinstance(v, ObjectId):
+                out[k] = str(v)
+            else:
+                out[k] = v
+        return out
+
+    deals = await database.db.deals.find({"contact_id": contact_id}).to_list(1000)
+    activities = await database.db.activities.find({"contact_id": contact_id}).sort("created_at", -1).to_list(1000)
+
+    email_logs = []
+    contact_email = contact.get("email", "")
+    if contact_email:
+        email_logs = await database.db.email_logs.find(
+            {"to_email": contact_email},
+            {"body": 0},  # full HTML body omitted for size; subject/status/timestamps kept
+        ).sort("created_at", -1).to_list(1000)
+
+    await log_audit(
+        request, user, action="export", resource_type="contact", resource_id=contact_id,
+    )
+
+    return {
+        "export_generated_at": datetime.utcnow().isoformat(),
+        "export_reason": "GDPR data subject access/portability request",
+        "contact": _serialize(contact),
+        "deals": [_serialize(d) for d in deals],
+        "activities": [_serialize(a) for a in activities],
+        "email_communications": [_serialize(e) for e in email_logs],
+    }
+
 @router.put("/contacts/{contact_id}")
-async def update_contact(contact_id: str, updates: ContactUpdate, user=Depends(get_current_user)):
+async def update_contact(contact_id: str, updates: ContactUpdate, request: Request, user=Depends(get_current_user)):
     """Update contact"""
     from app.config import database
 
@@ -197,6 +255,11 @@ async def update_contact(contact_id: str, updates: ContactUpdate, user=Depends(g
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Contact not found")
 
+    await log_audit(
+        request, user, action="update", resource_type="contact",
+        resource_id=contact_id, before=contact, after=update_data,
+    )
+
     return {
         "success": True,
         "id": contact_id,
@@ -204,7 +267,7 @@ async def update_contact(contact_id: str, updates: ContactUpdate, user=Depends(g
     }
 
 @router.delete("/contacts/{contact_id}")
-async def delete_contact(contact_id: str, user=Depends(get_current_user)):
+async def delete_contact(contact_id: str, request: Request, user=Depends(get_current_user)):
     """Delete contact"""
     from app.config import database
 
@@ -225,6 +288,11 @@ async def delete_contact(contact_id: str, user=Depends(get_current_user)):
 
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Contact not found")
+
+    await log_audit(
+        request, user, action="delete", resource_type="contact",
+        resource_id=contact_id, before=contact,
+    )
 
     await database.db.activities.insert_one({
         "type": "contact_deleted",
@@ -341,7 +409,7 @@ async def create_deal(deal: DealCreate, user=Depends(get_current_user)):
     }
 
 @router.put("/deals/{deal_id}")
-async def update_deal(deal_id: str, updates: DealUpdate, user=Depends(get_current_user)):
+async def update_deal(deal_id: str, updates: DealUpdate, request: Request, user=Depends(get_current_user)):
     """Update deal stage, value, notes - uses PUT method for drag and drop"""
     from app.config import database
 
@@ -379,10 +447,15 @@ async def update_deal(deal_id: str, updates: DealUpdate, user=Depends(get_curren
             "created_at": datetime.utcnow(),
         })
 
+    await log_audit(
+        request, user, action="update", resource_type="deal",
+        resource_id=deal_id, before=old_deal, after=update_data,
+    )
+
     return {"success": True, "updated": update_data}
 
 @router.delete("/deals/{deal_id}")
-async def delete_deal(deal_id: str, user=Depends(get_current_user)):
+async def delete_deal(deal_id: str, request: Request, user=Depends(get_current_user)):
     """Delete deal"""
     from app.config import database
 
@@ -391,10 +464,16 @@ async def delete_deal(deal_id: str, user=Depends(get_current_user)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid deal ID")
 
+    deal = await database.db.deals.find_one({"_id": obj_id})
     result = await database.db.deals.delete_one({"_id": obj_id})
 
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Deal not found")
+
+    await log_audit(
+        request, user, action="delete", resource_type="deal",
+        resource_id=deal_id, before=deal,
+    )
 
     return {"success": True}
 
