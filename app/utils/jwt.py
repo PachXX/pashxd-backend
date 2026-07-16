@@ -5,7 +5,17 @@ import os
 
 load_dotenv()
 
-JWT_SECRET = os.getenv("JWT_SECRET", "fallback-secret-change-this")
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    # Fail loud, not quiet: a hardcoded fallback here would mean every
+    # deployment missing this env var silently signs tokens with a secret
+    # published in this file's git history — anyone could forge an admin
+    # session. Matches the fail-closed RBAC policy in app/middleware/auth.py.
+    raise RuntimeError(
+        "JWT_SECRET environment variable is not set. Refusing to start with "
+        "a default signing secret. Set JWT_SECRET (Render: render.yaml "
+        "generateValue; local: add to backend/.env)."
+    )
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", 24))
 

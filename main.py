@@ -10,7 +10,7 @@ import logging
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 
 # ─── LOAD ENV FIRST ──────────────────────────────────────
@@ -19,22 +19,18 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 # ─── LOGGING ──────────────────────────────────────────────
-# Structured JSON logging on Cloud Run; plain text locally (LOG_FORMAT=text).
-from app.config.logging_config import configure_logging  # noqa: E402
 
-configure_logging()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─── DATABASE ─────────────────────────────────────────────
 
-mongo_url = os.getenv("MONGO_URL") or os.getenv("MONGODB_URL")
+mongo_url = os.getenv("MONGO_URL")
 if not mongo_url:
-    logger.warning("⚠️ MONGO_URL not set, using default localhost")
+    logger.warning("⚠️ MONGO_URL not set, using default")
     mongo_url = "mongodb://localhost:27017"
 
-# serverSelectionTimeoutMS keeps startup from hanging on an unreachable DB —
-# operations fail fast and loud so Cloud Run surfaces the error in logs.
-client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+client = AsyncIOMotorClient(mongo_url)
 db_name = os.getenv("DB_NAME", "pashxd")
 db_instance = client[db_name]
 
@@ -64,6 +60,27 @@ async def lifespan(app: FastAPI):
         await seed_admin()
     except Exception as e:
         logger.warning(f"⚠️ Admin seed skipped: {e}")
+
+    # TTL index expires login rate-limit docs (see app/routes/auth.py)
+    try:
+        await db_instance.login_attempts.create_index("expires_at", expireAfterSeconds=0)
+    except Exception as e:
+        logger.warning(f"⚠️ login_attempts TTL index skipped: {e}")
+
+    # TTL index expires global rate-limit docs (see rate_limit middleware above)
+    try:
+        await db_instance.rate_limit_hits.create_index("expires_at", expireAfterSeconds=0)
+        await db_instance.rate_limit_hits.create_index("key", unique=True)
+    except Exception as e:
+        logger.warning(f"⚠️ rate_limit_hits index skipped: {e}")
+
+    # Audit trail indexes — no TTL, these should NOT auto-expire (see app/utils/audit.py)
+    try:
+        await db_instance.audit_logs.create_index("resource_type")
+        await db_instance.audit_logs.create_index([("resource_type", 1), ("resource_id", 1)])
+        await db_instance.audit_logs.create_index("created_at")
+    except Exception as e:
+        logger.warning(f"⚠️ audit_logs index skipped: {e}")
 
     yield
 
@@ -107,6 +124,68 @@ async def add_process_time_header(request, call_next):
     response = await call_next(request)
     response.headers["X-App-Name"] = "PashxD"
     return response
+
+
+# ─── RATE LIMITING ───────────────────────────────────────
+# Global per-IP safety net on top of the stricter login-specific limiter in
+# app/routes/auth.py. Mongo-backed sliding window so the limit holds across
+# multiple instances. TTL index on rate_limit_hits.expires_at is created in
+# lifespan() above.
+
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "300"))
+RATE_LIMIT_WINDOW_MINUTES = int(os.getenv("RATE_LIMIT_WINDOW_MINUTES", "5"))
+RATE_LIMIT_EXEMPT_PATHS = {"/health", "/docs", "/openapi.json"}
+
+
+def _rl_client_ip(request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def rate_limit(request, call_next):
+    if request.url.path in RATE_LIMIT_EXEMPT_PATHS or request.method == "OPTIONS":
+        return await call_next(request)
+
+    try:
+        ip = _rl_client_ip(request)
+        now = datetime.utcnow()
+
+        doc = await db_instance.rate_limit_hits.find_one_and_update(
+            {"key": f"{ip}"},
+            {
+                "$inc": {"count": 1},
+                "$setOnInsert": {
+                    "expires_at": now + timedelta(minutes=RATE_LIMIT_WINDOW_MINUTES),
+                },
+            },
+            upsert=True,
+            return_document=True,
+        )
+
+        # Reset window if it expired but TTL sweep hasn't caught it yet.
+        if doc.get("expires_at", now) <= now:
+            await db_instance.rate_limit_hits.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"count": 1, "expires_at": now + timedelta(minutes=RATE_LIMIT_WINDOW_MINUTES)}},
+            )
+            doc["count"] = 1
+
+        if doc.get("count", 0) > RATE_LIMIT_MAX:
+            retry_after = int((doc["expires_at"] - now).total_seconds())
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Slow down."},
+                headers={"Retry-After": str(max(retry_after, 1))},
+            )
+    except Exception as e:
+        # Never let the limiter itself take the API down.
+        logger.warning(f"⚠️ rate_limit check skipped: {e}")
+
+    return await call_next(request)
 
 
 # ─── CORS ────────────────────────────────────────────────
@@ -306,6 +385,7 @@ route_modules = [
     "app.routes.dashboard",
     "app.routes.agents",
     "app.routes.outreach",
+    "app.routes.audit",
 ]
 
 for route_path in route_modules:

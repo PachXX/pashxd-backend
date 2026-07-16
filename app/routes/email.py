@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query, Depends
 from fastapi.responses import RedirectResponse, Response
-from app.middleware.auth import require_admin
+from app.middleware.auth import require_admin, get_current_user
+from app.utils.audit import log_audit
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -251,9 +252,10 @@ async def get_template(template_id: str):
     return serialize_doc(template)
 
 @router.put("/templates/{template_id}")
-async def update_template(template_id: str, template: EmailTemplate):
+async def update_template(template_id: str, template: EmailTemplate, request: Request, user=Depends(get_current_user)):
     """Update email template"""
     db = get_db()
+    before = await db.db.email_templates.find_one({"_id": obj_id(template_id)})
     update_data = {**template.dict(), "updated_at": datetime.utcnow()}
     result = await db.db.email_templates.update_one(
         {"_id": obj_id(template_id)}, {"$set": update_data}
@@ -261,15 +263,24 @@ async def update_template(template_id: str, template: EmailTemplate):
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Template not found")
     updated = await db.db.email_templates.find_one({"_id": obj_id(template_id)})
+    await log_audit(
+        request, user, action="update", resource_type="email_template",
+        resource_id=template_id, before=before, after=update_data,
+    )
     return serialize_doc(updated)
 
 @router.delete("/templates/{template_id}")
-async def delete_template(template_id: str):
+async def delete_template(template_id: str, request: Request, user=Depends(get_current_user)):
     """Delete email template"""
     db = get_db()
+    template = await db.db.email_templates.find_one({"_id": obj_id(template_id)})
     result = await db.db.email_templates.delete_one({"_id": obj_id(template_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Template not found")
+    await log_audit(
+        request, user, action="delete", resource_type="email_template",
+        resource_id=template_id, before=template,
+    )
     return {"success": True}
 
 # ==================== SEND SINGLE EMAIL ====================
