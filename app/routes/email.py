@@ -18,6 +18,7 @@ from urllib.parse import quote, urlparse
 logger = logging.getLogger(__name__)
 
 _SAFE_SCHEMES = {"http", "https"}
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def _safe_redirect_url(url: str) -> str | None:
     """Return url only if scheme is http/https; else None."""
@@ -40,10 +41,46 @@ router = APIRouter(prefix="/api/email", tags=["email"], dependencies=[Depends(re
 # Open/click tracking is hit by recipients' mail clients — must stay public.
 public_router = APIRouter(prefix="/api/email", tags=["email-tracking"])
 
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "info@pashx.com")
 SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "PashxD")
+SENDGRID_REPLY_TO = os.getenv("SENDGRID_REPLY_TO", "shahil.moideen@ilmtec.in")
+SENDGRID_CAMPAIGN_CC = os.getenv("SENDGRID_CAMPAIGN_CC", "")  # optional CC on every campaign send; empty disables
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+
+async def send_via_resend(
+    to_email: str, subject: str, html: str, to_name: str = "",
+    from_email: str = SENDGRID_FROM_EMAIL, from_name: str = SENDGRID_FROM_NAME,
+    reply_to: Optional[str] = None, cc: Optional[list[str]] = None, bcc: Optional[list[str]] = None,
+) -> tuple[bool, Optional[str]]:
+    """Send one email via Resend. Returns (sent_ok, error_message)."""
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY not configured"
+    payload = {
+        "from": f"{from_name} <{from_email}>" if from_name else from_email,
+        "to": [f"{to_name} <{to_email}>" if to_name else to_email],
+        "subject": subject,
+        "html": html,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
+    if cc:
+        payload["cc"] = cc
+    if bcc:
+        payload["bcc"] = bcc
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        if resp.status_code in (200, 201):
+            return True, None
+        return False, f"Resend {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        return False, str(e)
 
 # Global db reference - will be set by app.main in lifespan
 _db = None
@@ -187,6 +224,7 @@ class SendEmailRequest(BaseModel):
     deal_id: Optional[str] = None
     campaign_id: Optional[str] = None
     variables: dict = {}
+    idempotency_key: Optional[str] = None
 
 class CampaignCreate(BaseModel):
     name: str
@@ -290,6 +328,23 @@ async def send_email(request: SendEmailRequest):
     """Send a single email via SendGrid with tracking"""
     db = get_db()
 
+    # Dedup: if the caller passes the same idempotency_key twice (retry,
+    # double-click), return the original result instead of sending again.
+    if request.idempotency_key:
+        existing = await db.db.email_logs.find_one({
+            "idempotency_key": request.idempotency_key,
+            "status": {"$in": ["pending", "sent"]},
+        })
+        if existing:
+            return {
+                "success": existing["status"] == "sent",
+                "email_log_id": str(existing["_id"]),
+                "status": existing["status"],
+                "sent_at": existing.get("sent_at").isoformat() if existing.get("sent_at") else None,
+                "error": None,
+                "duplicate": True,
+            }
+
     # Replace variables in subject and body
     subject = request.subject
     body = request.body
@@ -316,6 +371,7 @@ async def send_email(request: SendEmailRequest):
         "open_count": 0,
         "click_count": 0,
         "created_at": datetime.utcnow(),
+        "idempotency_key": request.idempotency_key,
     }
     result = await db.db.email_logs.insert_one(email_log)
     log_id = str(result.inserted_id)
@@ -323,47 +379,31 @@ async def send_email(request: SendEmailRequest):
     # Inject tracking pixel and click tracking
     tracked_body = inject_tracking(body, log_id, request.to_email)
 
-    # Send via SendGrid
+    # Send via Resend
     sent = False
     error_msg = None
-    if SENDGRID_API_KEY:
-        try:
-            personalizations = {
-                "to": [{"email": request.to_email, "name": request.to_name or request.to_email}],
-                "subject": subject,
-            }
-            if request.cc:
-                personalizations["cc"] = [{"email": e.strip()} for e in request.cc.split(",") if e.strip()]
-            if request.bcc:
-                personalizations["bcc"] = [{"email": e.strip()} for e in request.bcc.split(",") if e.strip()]
+    cc_emails = None
+    bcc_emails = None
+    if request.cc:
+        cc_emails = [e.strip() for e in request.cc.split(",") if e.strip()]
+        invalid = [e for e in cc_emails if not _EMAIL_RE.match(e)]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Invalid cc email(s): {', '.join(invalid)}")
+    if request.bcc:
+        bcc_emails = [e.strip() for e in request.bcc.split(",") if e.strip()]
+        invalid = [e for e in bcc_emails if not _EMAIL_RE.match(e)]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Invalid bcc email(s): {', '.join(invalid)}")
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.sendgrid.com/v3/mail/send",
-                    headers={
-                        "Authorization": f"Bearer {SENDGRID_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "personalizations": [personalizations],
-                        "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
-                        "content": [{"type": "text/html", "value": tracked_body}],
-                        "tracking_settings": {
-                            "open_tracking": {"enable": False},
-                            "click_tracking": {"enable": False},
-                        },
-                    },
-                )
-                if response.status_code in [200, 201, 202]:
-                    sent = True
-                else:
-                    error_msg = f"SendGrid returned {response.status_code}"
-        except Exception as e:
-            error_msg = str(e)
+    if RESEND_API_KEY:
+        sent, error_msg = await send_via_resend(
+            to_email=request.to_email, to_name=request.to_name, subject=subject, html=tracked_body,
+            reply_to=SENDGRID_REPLY_TO, cc=cc_emails, bcc=bcc_emails,
+        )
     else:
         # No API key - log as sent for testing
         sent = True
-        error_msg = "SENDGRID_API_KEY not configured - logged locally"
+        error_msg = "RESEND_API_KEY not configured - logged locally"
 
     # Update log
     now = datetime.utcnow()
@@ -614,6 +654,8 @@ async def send_campaign(campaign_id: str):
         ids = campaign.get("selected_contact_ids", [])
         if ids:
             contact_query = {"_id": {"$in": [obj_id(i) for i in ids]}}
+    elif audience.startswith("company:"):
+        contact_query = {"company_id": audience.split(":", 1)[1]}
 
     contacts = await db.db.contacts.find(contact_query).to_list(10000)
     if not contacts:
@@ -664,44 +706,23 @@ async def send_campaign(campaign_id: str):
 
         tracked_body = inject_tracking(body, log_id, contact_email)
 
-        # Send via SendGrid
-        if SENDGRID_API_KEY:
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        "https://api.sendgrid.com/v3/mail/send",
-                        headers={
-                            "Authorization": f"Bearer {SENDGRID_API_KEY}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "personalizations": [
-                                {
-                                    "to": [{"email": contact_email, "name": variables.get("full_name", "")}],
-                                    "cc": [{"email": "moideenshahil2@gmail.com"}],
-                                    "subject": subject,
-                                }
-                            ],
-                            "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
-                            "content": [{"type": "text/html", "value": tracked_body}],
-                        },
-                    )
-                    if response.status_code in [200, 201, 202]:
-                        await db.db.email_logs.update_one(
-                            {"_id": log_result.inserted_id},
-                            {"$set": {"status": "sent", "sent_at": datetime.utcnow()}},
-                        )
-                        sent_count += 1
-                    else:
-                        await db.db.email_logs.update_one(
-                            {"_id": log_result.inserted_id},
-                            {"$set": {"status": "failed", "error": response.text}},
-                        )
-                        failed_count += 1
-            except Exception as e:
+        # Send via Resend
+        if RESEND_API_KEY:
+            cc_list = [SENDGRID_CAMPAIGN_CC] if SENDGRID_CAMPAIGN_CC else None
+            ok, err = await send_via_resend(
+                to_email=contact_email, to_name=variables.get("full_name", ""),
+                subject=subject, html=tracked_body, reply_to=SENDGRID_REPLY_TO, cc=cc_list,
+            )
+            if ok:
                 await db.db.email_logs.update_one(
                     {"_id": log_result.inserted_id},
-                    {"$set": {"status": "failed", "error": str(e)}},
+                    {"$set": {"status": "sent", "sent_at": datetime.utcnow()}},
+                )
+                sent_count += 1
+            else:
+                await db.db.email_logs.update_one(
+                    {"_id": log_result.inserted_id},
+                    {"$set": {"status": "failed", "error": err}},
                 )
                 failed_count += 1
         else:
@@ -828,11 +849,21 @@ async def import_contacts_csv(file: UploadFile = File(...)):
             continue
 
         try:
+            from app.services.company_resolver import resolve_or_create_company
+
+            company_text = row.get("company", "").strip()
+            name = row.get("name", "").strip()
+            company_id = await resolve_or_create_company(
+                db.db, email=email, company_text=company_text,
+                industry=row.get("industry", "").strip(), created_from="auto_csv_import",
+                contact_name=name,
+            )
             contact_doc = {
-                "name": row.get("name", "").strip(),
+                "name": name,
                 "email": email,
                 "phone": row.get("phone", "").strip(),
-                "company": row.get("company", "").strip(),
+                "company": company_text,
+                "company_id": company_id,
                 "role": row.get("role", row.get("job_title", "")).strip(),
                 "industry": row.get("industry", "").strip(),
                 "tags": [t.strip() for t in row.get("tags", "").split(",") if t.strip()],

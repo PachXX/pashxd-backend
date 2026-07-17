@@ -16,7 +16,6 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
@@ -38,7 +37,6 @@ MAX_STEP = len(CADENCE) - 1
 LEAD_SOURCES = ["saudi-lead-agent", "uk-lead-agent", "lead-agent"]
 
 NOTIFY_CC = os.getenv("OUTREACH_CC", "moideenshahil2@gmail.com")
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
 SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "shahil@pashx.com")
 SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "Shahil from PashxD")
 
@@ -303,35 +301,24 @@ async def approve_draft(draft_id: str, user=Depends(require_admin)):
     }
     log_res = await db.db.email_logs.insert_one(log_doc)
 
+    from app.routes.email import inject_tracking, send_via_resend, RESEND_API_KEY, SENDGRID_REPLY_TO
+    tracked_body = inject_tracking(draft.get("body_html", ""), str(log_res.inserted_id), to_email)
+
     sent_ok = False
     error = None
-    if SENDGRID_API_KEY:
-        cc_list = [{"email": NOTIFY_CC}]
+    if RESEND_API_KEY:
+        cc_list = [NOTIFY_CC]
         for e in (draft.get("cc_emails") or []):
             if e and e.lower() != NOTIFY_CC.lower():
-                cc_list.append({"email": e})
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "https://api.sendgrid.com/v3/mail/send",
-                    headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
-                    json={
-                        "personalizations": [{
-                            "to": [{"email": to_email, "name": draft.get("contact_name", "")}],
-                            "cc": cc_list,
-                            "subject": draft.get("subject", ""),
-                        }],
-                        "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
-                        "content": [{"type": "text/html", "value": draft.get("body_html", "")}],
-                    },
-                )
-                sent_ok = resp.status_code in (200, 201, 202)
-                if not sent_ok:
-                    error = f"SendGrid {resp.status_code}: {resp.text[:200]}"
-        except Exception as e:
-            error = str(e)
+                cc_list.append(e)
+        sent_ok, error = await send_via_resend(
+            to_email=to_email, to_name=draft.get("contact_name", ""),
+            subject=draft.get("subject", ""), html=tracked_body,
+            from_email=SENDGRID_FROM_EMAIL, from_name=SENDGRID_FROM_NAME,
+            reply_to=SENDGRID_REPLY_TO, cc=cc_list,
+        )
     else:
-        error = "SENDGRID_API_KEY not configured"
+        error = "RESEND_API_KEY not configured"
 
     if not sent_ok:
         await db.db.email_logs.update_one({"_id": log_res.inserted_id}, {"$set": {"status": "failed"}})
