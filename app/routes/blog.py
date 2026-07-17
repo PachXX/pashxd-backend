@@ -6,6 +6,7 @@ from bson import ObjectId
 import re
 import nh3
 from app.middleware.auth import require_admin
+from app.utils.readability import get_readability, build_seo_checks
 
 router = APIRouter(prefix="/api/blogs", tags=["blog"])
 
@@ -311,10 +312,24 @@ async def toggle_publish(blog_id: str, user=Depends(require_admin)):
 
     new_status = "draft" if blog.get("status") == "published" else "published"
 
-    await database.db.blogs.update_one(
-        {"_id": obj_id},
-        {"$set": {"status": new_status, "updated_at": datetime.utcnow()}}
-    )
+    update = {"status": new_status, "updated_at": datetime.utcnow()}
+
+    # Publishing (not unpublishing) — run the same checks the SEO tool
+    # exposes manually, automatically, so the score is there without a
+    # separate trip to /seo.
+    if new_status == "published":
+        content = blog.get("content", "")
+        readability = get_readability(content)
+        update["readability_score"] = readability["seo_score"]
+        update["seo_score"] = readability["seo_score"]
+        update["seo_checks"] = build_seo_checks(
+            blog.get("meta_title") or blog.get("title", ""),
+            content,
+            blog.get("meta_description", ""),
+        )
+        update["seo_checked_at"] = datetime.utcnow()
+
+    await database.db.blogs.update_one({"_id": obj_id}, {"$set": update})
 
     return {"success": True, "status": new_status}
 

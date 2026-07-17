@@ -40,6 +40,39 @@ def get_readability(text: str) -> dict:
     }
 
 
+def build_seo_checks(title: str, content: str, meta_description: str = "") -> list:
+    """Same title/meta/word-count checks seo.py's /analyze exposes manually —
+    factored out so blog.py can run them automatically on publish instead of
+    requiring a separate trip to the SEO tool."""
+    scores = get_readability(content)
+    checks = []
+
+    if title:
+        if len(title) < 30:
+            checks.append({"type": "warning", "msg": "Title is too short. Aim for 40-60 characters."})
+        elif len(title) > 60:
+            checks.append({"type": "warning", "msg": "Title is too long. Keep it under 60 characters."})
+        else:
+            checks.append({"type": "success", "msg": "Title length is good."})
+
+    if meta_description:
+        if len(meta_description) < 120:
+            checks.append({"type": "warning", "msg": "Meta description is too short. Aim for 140-160 characters."})
+        elif len(meta_description) > 160:
+            checks.append({"type": "warning", "msg": "Meta description is too long. Keep under 160 characters."})
+        else:
+            checks.append({"type": "success", "msg": "Meta description length is perfect."})
+    else:
+        checks.append({"type": "error", "msg": "Meta description is missing."})
+
+    if scores["word_count"] < 300:
+        checks.append({"type": "error", "msg": "Content too short. Aim for at least 600 words."})
+    elif scores["word_count"] >= 600:
+        checks.append({"type": "success", "msg": f"Good content length: {scores['word_count']} words."})
+
+    return checks
+
+
 def get_keyword_density(text: str, top_n: int = 10) -> list:
     clean = re.sub(r"<[^>]+>", "", text).lower()
     # Remove common stop words
