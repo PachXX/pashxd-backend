@@ -5,6 +5,7 @@ from datetime import datetime
 from bson import ObjectId
 from app.middleware.auth import get_current_user
 from app.utils.audit import log_audit
+from app.services.company_resolver import resolve_company_key
 
 router = APIRouter(prefix="/api/crm", tags=["crm"])
 
@@ -307,7 +308,14 @@ async def delete_contact(contact_id: str, request: Request, user=Depends(get_cur
 
 @router.get("/pipeline")
 async def get_pipeline(user=Depends(get_current_user)):
-    """Get all deals organized by stage"""
+    """Get all deals organized by stage, grouped into company cards.
+
+    Deals/contacts already backfilled with `company_id` (see
+    scripts/migrate_companies.py) group by that id. Anything not yet
+    migrated is grouped live via the same normalized-key logic the
+    migration uses (resolve_company_key), so the board never falls back
+    to a bare "Unknown" card just because the backfill hasn't run yet.
+    """
     from app.config import database
 
     deals = await database.db.deals.find({}).to_list(1000)
@@ -335,12 +343,37 @@ async def get_pipeline(user=Depends(get_current_user)):
     if contact_oids:
         cursor = database.db.contacts.find(
             {"_id": {"$in": contact_oids}},
-            {"name": 1, "email": 1, "company": 1},
+            {"name": 1, "email": 1, "company": 1, "company_id": 1},
         )
         async for c in cursor:
             contacts_by_id[str(c["_id"])] = c
 
+    # Resolve display names for already-migrated company_ids in one batch.
+    company_ids = {d["company_id"] for d in deals if d.get("company_id")}
+    company_ids |= {c["company_id"] for c in contacts_by_id.values() if c.get("company_id")}
+    companies_by_id = {}
+    if company_ids:
+        valid_oids = []
+        for cid in company_ids:
+            try:
+                valid_oids.append(ObjectId(cid))
+            except Exception:
+                pass
+        cursor = database.db.companies.find({"_id": {"$in": valid_oids}}, {"name": 1})
+        async for co in cursor:
+            companies_by_id[str(co["_id"])] = co
+
+    # stage -> group_key -> card. group_key is the real company_id when
+    # migrated, otherwise the same normalized_key the backfill would land
+    # on, so re-running the migration later never changes which deals are
+    # already sitting together on the board.
+    grouped = {stage: {} for stage in pipeline}
+
     for deal in deals:
+        stage = deal.get("stage", "lead")
+        if stage not in pipeline:
+            stage = "lead"
+
         contact = contacts_by_id.get(str(deal.get("contact_id", "")))
 
         deal_data = {
@@ -362,9 +395,42 @@ async def get_pipeline(user=Depends(get_current_user)):
             }
         }
 
-        stage = deal.get("stage", "lead")
-        if stage in pipeline:
-            pipeline[stage].append(deal_data)
+        company_id = deal.get("company_id") or (contact.get("company_id") if contact else None)
+        if company_id:
+            group_key = company_id
+            company_name = (
+                companies_by_id.get(company_id, {}).get("name")
+                or (contact.get("company") if contact else "")
+                or "Unknown"
+            )
+        else:
+            email = contact.get("email", "") if contact else ""
+            company_text = contact.get("company", "") if contact else ""
+            info = resolve_company_key(email, company_text)
+            group_key = info["normalized_key"]
+            company_name = info["display_name"]
+
+        card = grouped[stage].get(group_key)
+        if not card:
+            card = {
+                "company_id": company_id,  # None until the backfill runs
+                "company_name": company_name,
+                "total_value": 0,
+                "deals": [],
+                "_contact_ids": set(),
+            }
+            grouped[stage][group_key] = card
+
+        card["deals"].append(deal_data)
+        card["total_value"] += deal.get("value", 0) or 0
+        if contact:
+            card["_contact_ids"].add(str(contact["_id"]))
+
+    for stage, cards_by_key in grouped.items():
+        cards = list(cards_by_key.values())
+        for card in cards:
+            card["contact_count"] = len(card.pop("_contact_ids"))
+        pipeline[stage] = cards
 
     return pipeline
 
