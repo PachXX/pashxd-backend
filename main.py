@@ -221,7 +221,12 @@ def get_allowed_origins():
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
-    allow_origin_regex=r"https://.*\.vercel\.app",  # ✅ allow ALL Vercel previews
+    # Scoped to this Vercel team's preview-deployment suffix only — the
+    # previous r"https://.*\.vercel\.app" matched ANY vercel.app subdomain,
+    # including ones on someone else's free account, which combined with
+    # allow_credentials=True let an attacker-controlled page make
+    # credentialed cross-origin requests against this API.
+    allow_origin_regex=r"https://[a-z0-9-]+-moideenshahil2-7416s-projects\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
