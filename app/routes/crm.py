@@ -635,6 +635,29 @@ async def create_activity(activity: ActivityCreate, user=Depends(get_current_use
         "created_at": activity_doc["created_at"].isoformat(),
     }
 
+@router.delete("/activities/{activity_id}")
+async def delete_activity(activity_id: str, request: Request, user=Depends(get_current_user)):
+    """Delete activity log entry"""
+    from app.config import database
+
+    try:
+        obj_id = ObjectId(activity_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid activity ID")
+
+    activity = await database.db.activities.find_one({"_id": obj_id})
+    result = await database.db.activities.delete_one({"_id": obj_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    await log_audit(
+        request, user, action="delete", resource_type="activity",
+        resource_id=activity_id, before=activity,
+    )
+
+    return {"success": True}
+
 
 # ==================== DASHBOARD STATS ====================
 
