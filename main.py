@@ -380,6 +380,7 @@ route_modules = [
     "app.routes.auth",
     "app.routes.blog",
     "app.routes.crm",
+    "app.routes.companies",
     "app.routes.email",  # ← EMAIL ROUTE
     "app.routes.seo",
     "app.routes.dashboard",

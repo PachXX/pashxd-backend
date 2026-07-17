@@ -5,7 +5,7 @@ from datetime import datetime
 from bson import ObjectId
 from app.middleware.auth import get_current_user
 from app.utils.audit import log_audit
-from app.services.company_resolver import resolve_company_key
+from app.services.company_resolver import resolve_company_key, resolve_or_create_company
 
 router = APIRouter(prefix="/api/crm", tags=["crm"])
 
@@ -111,8 +111,17 @@ async def create_contact(contact: ContactCreate, user=Depends(get_current_user))
     if existing:
         raise HTTPException(status_code=400, detail="Contact with this email already exists")
 
+    company_id = await resolve_or_create_company(
+        database.db,
+        email=contact.email,
+        company_text=contact.company,
+        industry=contact.industry,
+        contact_name=contact.name,
+    )
+
     contact_doc = {
         **contact.dict(),
+        "company_id": company_id,
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }
@@ -130,6 +139,7 @@ async def create_contact(contact: ContactCreate, user=Depends(get_current_user))
     return {
         "id": str(result.inserted_id),
         **contact.dict(),
+        "company_id": company_id,
         "created_at": contact_doc["created_at"].isoformat(),
         "updated_at": contact_doc["updated_at"].isoformat(),
     }
@@ -449,6 +459,7 @@ async def create_deal(deal: DealCreate, user=Depends(get_current_user)):
 
     deal_doc = {
         **deal.dict(),
+        "company_id": contact.get("company_id"),
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }
@@ -470,6 +481,7 @@ async def create_deal(deal: DealCreate, user=Depends(get_current_user)):
         "contact_name": contact.get("name", ""),
         "contact_email": contact.get("email", ""),
         "company": contact.get("company", ""),
+        "company_id": deal_doc["company_id"],
         "created_at": deal_doc["created_at"].isoformat(),
         "updated_at": deal_doc["updated_at"].isoformat(),
     }
