@@ -12,10 +12,13 @@ Flow:
 
 Nothing is ever auto-sent. Sequence state lives here (dashboard-authoritative).
 """
+import html
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
@@ -40,6 +43,31 @@ NOTIFY_CC = os.getenv("OUTREACH_CC", "moideenshahil2@gmail.com")
 SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "shahil@pashx.com")
 SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "Shahil from PashxD")
 
+# ─── AI REGENERATION ──────────────────────────────────────────────────────────
+# Mirrors mcp-server/outreach_agent.py's generate_copy()/render_html() exactly,
+# so a regenerated draft reads in the same voice as one the agent drafted.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+SENDER_NAME = os.getenv("OUTREACH_SENDER_NAME", "Shahil")
+CALENDLY_URL = os.getenv("CALENDLY_URL", "https://calendly.com/shahil-talenlio-letstalk/letstalk")
+CRM_URL = os.getenv("CRM_URL", "https://crm.pashx.com")
+BRAND_COLOR = "#2ECC71"
+
+STEP_BRIEF = {
+    "intro":    "First cold email. Open with a specific hook drawn from their business context. State one concrete PashxD benefit relevant to them. Soft CTA for a 15-min call. Warm, human, no corporate fluff.",
+    "followup": "Second touch, they didn't reply to the intro. Short, friendly bump. Add ONE new angle or question — do not repeat the intro. Very brief.",
+    "value":    "Third touch. Lead with proof: a concrete result, mini case-study style, or a sharp insight about their industry. Show don't tell. Still short.",
+    "breakup":  "Final email. Low-pressure 'closing the loop' note. Gracious, leaves the door open. Two sentences max in the body.",
+}
+
+BANNED_PHRASES = [
+    "game-changer", "in today's fast-paced world", "unlock", "leverage",
+    "synergy", "revolutionize", "seamless", "seamlessly", "elevate",
+    "supercharge", "cutting-edge", "next-level", "paradigm shift",
+    "I hope this finds you well", "dear valued", "esteemed", "delve",
+    "moreover", "furthermore", "in conclusion", "plethora", "myriad",
+    "robust", "empower", "empowering", "testament to", "boasts",
+]
+
 
 # ─── MODELS ───────────────────────────────────────────────────────────────────
 
@@ -50,6 +78,11 @@ class DraftCreate(BaseModel):
     body_html: str
     personalization_notes: Optional[str] = None
     cc_emails: Optional[list[str]] = None
+
+
+class DraftUpdate(BaseModel):
+    subject: Optional[str] = None
+    body_html: Optional[str] = None
 
 
 class EnrollRequest(BaseModel):
@@ -269,6 +302,161 @@ async def list_drafts(status: str = "pending", limit: int = 100, user=Depends(ge
     q = {} if status == "all" else {"status": status}
     drafts = await db.db.outreach_drafts.find(q).sort("created_at", -1).to_list(limit)
     return {"drafts": [_serialize_draft(d) for d in drafts]}
+
+
+@router.patch("/drafts/{draft_id}")
+async def update_draft(draft_id: str, updates: DraftUpdate, user=Depends(require_admin)):
+    """Manual edit of a pending draft's subject/body_html."""
+    from app.config import database
+    db = database
+
+    draft = await db.db.outreach_drafts.find_one({"_id": _oid(draft_id)})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("status") != "pending":
+        raise HTTPException(status_code=400, detail=f"Draft is {draft.get('status')}, not pending")
+
+    patch = {k: v for k, v in updates.dict().items() if v is not None}
+    if not patch:
+        return _serialize_draft(draft)
+
+    await db.db.outreach_drafts.update_one({"_id": draft["_id"]}, {"$set": patch})
+    updated = await db.db.outreach_drafts.find_one({"_id": draft["_id"]})
+    return _serialize_draft(updated)
+
+
+async def _generate_copy(kind: str, contact_name: str, company: str, notes: str) -> dict:
+    """Ask Claude for hyper-personalised copy. Returns {subject, preview, paragraphs, cta_label}.
+
+    Mirrors mcp-server/outreach_agent.py's generate_copy() — same prompt,
+    same voice — so a regenerated draft doesn't read differently from one
+    the agent originally drafted.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on backend")
+
+    prompt = f"""You are {SENDER_NAME}, founder of PashxD (pashx.com) — an AI-native trading & retail platform (CRM, quotations, multi-branch stock, VAT/ZATCA e-invoicing) for SMBs.
+
+Write a {kind} cold outreach email to this prospect. Be HYPER-PERSONALISED using their specific context — never generic.
+
+PROSPECT:
+- Name: {contact_name}
+- Company: {company}
+- Contact notes (score, pain, current software, ZATCA phase): {notes or 'none on file'}
+
+EMAIL TYPE: {kind}
+BRIEF: {STEP_BRIEF.get(kind, STEP_BRIEF['intro'])}
+
+RULES:
+- Under 90 words in the body. Real sentences, no buzzwords.
+- NEVER use these phrases or close variants: {", ".join(BANNED_PHRASES)}.
+- Vary sentence length — one short line, one longer one. Uniform sentence length reads as AI-generated.
+- Use contractions naturally (it's, don't, that's) — write like {SENDER_NAME} personally typed this, not a brand voice.
+- Reference something specific to THEM in the first line — a real detail, not a generic compliment.
+- One clear soft CTA (a 15-min call). Do not paste the link in the body text; a button is added separately.
+- Sign as {SENDER_NAME}.
+
+Return ONLY JSON (no markdown), exactly:
+{{"subject": "<subject line, under 60 chars, personalised>",
+  "preview": "<preheader, under 90 chars>",
+  "paragraphs": ["<para 1>", "<para 2>", "..."],
+  "cta_label": "<short button label e.g. 'Grab 15 minutes'>"}}"""
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 900,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Claude API error {resp.status_code}")
+
+    raw = resp.json()["content"][0]["text"].strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+
+
+def _render_html(contact_name: str, company: str, copy: dict) -> str:
+    """Wrap personalised copy in the same branded template outreach_agent.py uses."""
+    name = html.escape((contact_name or "there").split(" ")[0] or "there")
+    company_esc = html.escape(company or "your business")
+    paras = "".join(
+        f'<p style="margin:0 0 16px;font-size:15px;line-height:1.65;color:#2b2f36;">{html.escape(p)}</p>'
+        for p in copy.get("paragraphs", [])
+    )
+    cta_label = html.escape(copy.get("cta_label", "Book 15 minutes"))
+    return f"""<!doctype html>
+<html><body style="margin:0;padding:0;background:#f4f6f8;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f8;padding:28px 0;">
+<tr><td align="center">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,24,40,0.08);">
+    <tr><td style="padding:22px 32px 8px;">
+      <span style="font-family:'Segoe UI',Arial,sans-serif;font-size:19px;font-weight:800;letter-spacing:-0.02em;color:#0D1117;">Pash<span style="color:{BRAND_COLOR};">xD</span></span>
+    </td></tr>
+    <tr><td style="padding:8px 32px 4px;font-family:'Segoe UI',Arial,sans-serif;">
+      <p style="margin:0 0 16px;font-size:15px;line-height:1.65;color:#2b2f36;">Hi {name},</p>
+      {paras}
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:8px 0 12px;"><tr>
+        <td style="border-radius:8px;background:{BRAND_COLOR};">
+          <a href="{CALENDLY_URL}" style="display:inline-block;padding:11px 22px;font-family:'Segoe UI',Arial,sans-serif;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:8px;">{cta_label} →</a>
+        </td>
+      </tr></table>
+      <p style="margin:0 0 20px;font-size:13px;line-height:1.6;color:#8a9099;">Prefer to look around first? See it live at <a href="{CRM_URL}" style="color:{BRAND_COLOR};text-decoration:none;font-weight:600;">crm.pashx.com</a></p>
+      <p style="margin:0 0 4px;font-size:15px;line-height:1.6;color:#2b2f36;">— {SENDER_NAME}</p>
+      <p style="margin:0 0 18px;font-size:13px;color:#8a9099;">PashxD · <a href="https://pashx.com" style="color:{BRAND_COLOR};text-decoration:none;">pashx.com</a></p>
+    </td></tr>
+    <tr><td style="padding:14px 32px;border-top:1px solid #eef0f2;font-family:'Segoe UI',Arial,sans-serif;">
+      <p style="margin:0;font-size:11px;color:#aab0b8;">You're receiving this because PashxD may be a fit for {company_esc}. Reply "no thanks" and I won't follow up.</p>
+    </td></tr>
+  </table>
+</td></tr></table>
+</body></html>"""
+
+
+@router.post("/drafts/{draft_id}/regenerate")
+async def regenerate_draft(draft_id: str, user=Depends(require_admin)):
+    """Re-generate a pending draft's copy via Claude, same voice as the agent."""
+    from app.config import database
+    db = database
+
+    draft = await db.db.outreach_drafts.find_one({"_id": _oid(draft_id)})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("status") != "pending":
+        raise HTTPException(status_code=400, detail=f"Draft is {draft.get('status')}, not pending")
+
+    contact = await db.db.contacts.find_one({"_id": _oid(draft["contact_id"])}) if draft.get("contact_id") else None
+    notes = contact.get("notes", "") if contact else ""
+
+    copy = await _generate_copy(
+        kind=draft.get("kind", "intro"),
+        contact_name=draft.get("contact_name", ""),
+        company=draft.get("company", ""),
+        notes=notes,
+    )
+    body_html = _render_html(draft.get("contact_name", ""), draft.get("company", ""), copy)
+
+    await db.db.outreach_drafts.update_one(
+        {"_id": draft["_id"]},
+        {"$set": {
+            "subject": copy.get("subject", draft.get("subject")),
+            "body_html": body_html,
+            "personalization_notes": copy.get("preview", ""),
+        }},
+    )
+    updated = await db.db.outreach_drafts.find_one({"_id": draft["_id"]})
+    return _serialize_draft(updated)
 
 
 @router.post("/drafts/{draft_id}/approve")
