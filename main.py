@@ -386,6 +386,7 @@ route_modules = [
     "app.routes.agents",
     "app.routes.outreach",
     "app.routes.audit",
+    "app.routes.linkedin",
 ]
 
 for route_path in route_modules:
