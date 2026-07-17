@@ -1,6 +1,6 @@
 import os
 
-from fastapi import APIRouter, HTTPException, status, Depends, Request
+from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
 from app.models.schemas import UserLogin, UserCreate, TokenResponse, MessageResponse
 from app.utils.jwt import create_token
 from app.utils.hash import hash_password, verify_password
@@ -97,6 +97,18 @@ async def get_me(user=Depends(require_admin)):
         "role": doc.get("role", "admin"),
         "created_at": doc.get("created_at"),
     }
+
+
+@router.post("/logout", response_model=MessageResponse)
+async def logout(response: Response):
+    """Auth is a stateless Bearer JWT today — the dashboard already clears
+    its local token before calling this — so there's nothing to invalidate
+    server-side. This exists so the call succeeds instead of 404ing, and
+    clears any auth cookie defensively so it's a no-op today but correct
+    once cookie-based sessions land (harmless if no cookie was ever set:
+    delete_cookie on a missing cookie is a no-op)."""
+    response.delete_cookie("access_token")
+    return {"message": "Logged out successfully"}
 
 
 @router.post("/change-password", response_model=MessageResponse)
