@@ -21,7 +21,7 @@ async def generate_sitemap():
 
     static_pages = [
         "/", "/product", "/pricing", "/industries",
-        "/about", "/resources", "/contact", "/marketplace",
+        "/about", "/resources", "/contact", "/marketplace", "/book-demo",
     ]
 
     urls = []
