@@ -54,6 +54,10 @@ class DraftCreate(BaseModel):
     cc_emails: Optional[list[str]] = None
 
 
+class EnrollRequest(BaseModel):
+    company_id: str
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -211,6 +215,7 @@ async def create_draft(draft: DraftCreate, user=Depends(require_admin)):
             "contact_name": contact.get("name", ""),
             "contact_email": contact.get("email", ""),
             "company": contact.get("company", ""),
+            "company_id": contact.get("company_id"),
             "notes": contact.get("notes", ""),
             "status": "active",
             "current_step": draft.step,
@@ -243,6 +248,7 @@ async def create_draft(draft: DraftCreate, user=Depends(require_admin)):
         "contact_name": seq.get("contact_name"),
         "contact_email": seq.get("contact_email"),
         "company": seq.get("company"),
+        "company_id": seq.get("company_id"),
         "step": draft.step,
         "kind": c["kind"],
         "subject": draft.subject,
@@ -361,12 +367,15 @@ async def skip_draft(draft_id: str, user=Depends(require_admin)):
 
 
 @router.get("/sent")
-async def list_sent(limit: int = 50, user=Depends(get_current_user)):
+async def list_sent(limit: int = 50, company_id: Optional[str] = None, user=Depends(get_current_user)):
     """Recently sent outreach emails, enriched with each sequence's next follow-up."""
     from app.config import database
     db = database
     limit = max(1, min(limit, 200))
-    sent = await db.db.outreach_drafts.find({"status": "sent"}).sort("sent_at", -1).to_list(limit)
+    q = {"status": "sent"}
+    if company_id:
+        q["company_id"] = company_id
+    sent = await db.db.outreach_drafts.find(q).sort("sent_at", -1).to_list(limit)
 
     seq_ids = list({d.get("sequence_id") for d in sent if d.get("sequence_id")})
     seq_map = {}
@@ -429,16 +438,69 @@ async def reset_outreach(pending_only: bool = True, user=Depends(require_admin))
 
 
 @router.get("/sequences")
-async def list_sequences(status: Optional[str] = None, limit: int = 200, user=Depends(get_current_user)):
+async def list_sequences(
+    status: Optional[str] = None, company_id: Optional[str] = None,
+    limit: int = 200, user=Depends(get_current_user),
+):
     from app.config import database
     db = database
     limit = max(1, min(limit, 500))
-    q = {} if not status else {"status": status}
+    q = {}
+    if status:
+        q["status"] = status
+    if company_id:
+        q["company_id"] = company_id
     seqs = await db.db.outreach_sequences.find(q).sort("updated_at", -1).to_list(limit)
     counts = {}
     for st in ["active", "hot", "completed", "stopped"]:
         counts[st] = await db.db.outreach_sequences.count_documents({"status": st})
     return {"sequences": [_serialize_seq(s) for s in seqs], "counts": counts}
+
+
+@router.post("/enroll")
+async def enroll_company(req: EnrollRequest, user=Depends(require_admin)):
+    """Manually start outreach for every contact at a company that isn't
+    already enrolled — for CRM entries that didn't come through a
+    lead-sourcing agent and so never hit the LEAD_SOURCES auto-enrollment
+    in get_due()."""
+    from app.config import database
+    db = database
+
+    contacts = await db.db.contacts.find(
+        {"company_id": req.company_id, "email": {"$nin": ["", None]}}
+    ).to_list(500)
+    if not contacts:
+        raise HTTPException(status_code=404, detail="No contacts with an email found for this company")
+
+    enrolled_ids = set(
+        s.get("contact_id") for s in await db.db.outreach_sequences.find({}, {"contact_id": 1}).to_list(5000)
+    )
+
+    enrolled, skipped = [], []
+    for c in contacts:
+        cid = str(c["_id"])
+        if cid in enrolled_ids:
+            skipped.append(cid)
+            continue
+        seq_doc = {
+            "contact_id": cid,
+            "contact_name": c.get("name", ""),
+            "contact_email": c.get("email", ""),
+            "company": c.get("company", ""),
+            "company_id": c.get("company_id"),
+            "notes": c.get("notes", ""),
+            "status": "active",
+            "current_step": 0,
+            "started_at": _now(),
+            "last_sent_at": None,
+            "next_due_at": _now(),
+            "created_at": _now(),
+            "updated_at": _now(),
+        }
+        res = await db.db.outreach_sequences.insert_one(seq_doc)
+        enrolled.append(str(res.inserted_id))
+
+    return {"ok": True, "enrolled": len(enrolled), "skipped_already_enrolled": len(skipped)}
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
