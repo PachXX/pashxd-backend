@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import os
 import logging
+import time
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 import uuid
@@ -33,6 +34,8 @@ if not mongo_url:
 client = AsyncIOMotorClient(mongo_url)
 db_name = os.getenv("DB_NAME", "pashxd")
 db_instance = client[db_name]
+
+_START_TIME = time.monotonic()
 
 # ─── LIFESPAN ─────────────────────────────────────────────
 
@@ -419,7 +422,20 @@ for insights_path in ["app.api.routes.insights", "app.routes.insights"]:
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "pashxd-api"}
+    """Health check endpoint. DB check is best-effort — a Mongo hiccup
+    degrades the status instead of taking the whole health check down."""
+    body = {
+        "status": "healthy",
+        "service": "pashxd-api",
+        "uptime_seconds": round(time.monotonic() - _START_TIME, 1),
+    }
+    try:
+        start = time.monotonic()
+        await db_instance.command("ping")
+        body["db"] = {"status": "ok", "latency_ms": round((time.monotonic() - start) * 1000, 1)}
+    except Exception as e:
+        body["status"] = "degraded"
+        body["db"] = {"status": "error", "detail": str(e)[:200]}
+    return body
 
 logger.info("🚀 Application initialized")

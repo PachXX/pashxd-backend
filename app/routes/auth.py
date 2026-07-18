@@ -2,9 +2,9 @@ import os
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
 from app.models.schemas import UserLogin, UserCreate, TokenResponse, MessageResponse
-from app.utils.jwt import create_token
+from app.utils.jwt import create_token, JWT_EXPIRE_HOURS
 from app.utils.hash import hash_password, verify_password
-from app.middleware.auth import require_admin
+from app.middleware.auth import require_admin, get_current_user, COOKIE_NAME, COOKIE_SECURE, COOKIE_SAMESITE
 from app.config.database import get_db
 from datetime import datetime, timedelta
 
@@ -25,7 +25,7 @@ def _client_ip(request: Request) -> str:
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: UserLogin, request: Request):
+async def login(body: UserLogin, request: Request, response: Response):
     db = get_db()
 
     attempt_key = f"{_client_ip(request)}:{body.email.lower()}"
@@ -73,6 +73,20 @@ async def login(body: UserLogin, request: Request):
         "role": user.get("role", "admin"),
     })
 
+    # httpOnly session cookie — the dashboard and marketing site live on a
+    # different origin than the API, so SameSite=None; Secure is required
+    # for the browser to send it back cross-site. Bearer header still works
+    # unchanged (see get_current_user) for anything not switched over yet.
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        max_age=JWT_EXPIRE_HOURS * 3600,
+        path="/",
+    )
+
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -85,7 +99,7 @@ async def login(body: UserLogin, request: Request):
 
 
 @router.get("/me")
-async def get_me(user=Depends(require_admin)):
+async def get_me(user=Depends(get_current_user)):
     db = get_db()
     from bson import ObjectId
     doc = await db.users.find_one({"_id": ObjectId(user["sub"])})
@@ -101,13 +115,11 @@ async def get_me(user=Depends(require_admin)):
 
 @router.post("/logout", response_model=MessageResponse)
 async def logout(response: Response):
-    """Auth is a stateless Bearer JWT today — the dashboard already clears
-    its local token before calling this — so there's nothing to invalidate
-    server-side. This exists so the call succeeds instead of 404ing, and
-    clears any auth cookie defensively so it's a no-op today but correct
-    once cookie-based sessions land (harmless if no cookie was ever set:
-    delete_cookie on a missing cookie is a no-op)."""
-    response.delete_cookie("access_token")
+    """Auth is stateless Bearer JWT + an optional session cookie — nothing
+    to invalidate server-side either way, so this just clears the cookie.
+    delete_cookie must repeat the secure/samesite/path attributes it was
+    set with, or some browsers silently keep it."""
+    response.delete_cookie(COOKIE_NAME, path="/", secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
     return {"message": "Logged out successfully"}
 
 

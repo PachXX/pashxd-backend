@@ -377,7 +377,17 @@ async def get_pipeline(user=Depends(get_current_user)):
     # migrated, otherwise the same normalized_key the backfill would land
     # on, so re-running the migration later never changes which deals are
     # already sitting together on the board.
-    grouped = {stage: {} for stage in pipeline}
+    #
+    # A company gets exactly one card, holding every one of its deals
+    # regardless of stage — not one card per (company, stage) pair. The
+    # card's column is the company's most advanced *live* stage (matches
+    # the same STAGE_RANK logic companies.py already uses for its own
+    # stage/open-value rollups), falling back to "lost" only once every
+    # deal is lost. A company with deals split across lead/proposal isn't
+    # fragmented across two columns — it shows once, where it's furthest
+    # along, with the full deal list still visible in that one card.
+    STAGE_RANK = {"lead": 0, "qualified": 1, "proposal": 2, "negotiation": 3, "won": 4}
+    grouped: dict = {}
 
     for deal in deals:
         stage = deal.get("stage", "lead")
@@ -391,7 +401,7 @@ async def get_pipeline(user=Depends(get_current_user)):
             "title": deal.get("title", ""),
             "value": deal.get("value", 0),
             "currency": deal.get("currency", "EUR"),
-            "stage": deal.get("stage", "lead"),
+            "stage": stage,
             "probability": deal.get("probability", 10),
             "notes": deal.get("notes", ""),
             "source": deal.get("source", "manual"),
@@ -420,7 +430,7 @@ async def get_pipeline(user=Depends(get_current_user)):
             group_key = info["normalized_key"]
             company_name = info["display_name"]
 
-        card = grouped[stage].get(group_key)
+        card = grouped.get(group_key)
         if not card:
             card = {
                 "company_id": company_id,  # None until the backfill runs
@@ -429,18 +439,23 @@ async def get_pipeline(user=Depends(get_current_user)):
                 "deals": [],
                 "_contact_ids": set(),
             }
-            grouped[stage][group_key] = card
+            grouped[group_key] = card
 
         card["deals"].append(deal_data)
         card["total_value"] += deal.get("value", 0) or 0
         if contact:
             card["_contact_ids"].add(str(contact["_id"]))
 
-    for stage, cards_by_key in grouped.items():
-        cards = list(cards_by_key.values())
-        for card in cards:
-            card["contact_count"] = len(card.pop("_contact_ids"))
-        pipeline[stage] = cards
+    for card in grouped.values():
+        card["contact_count"] = len(card.pop("_contact_ids"))
+        card["deal_count"] = len(card["deals"])
+
+        live_deals = [d for d in card["deals"] if d["stage"] != "lost"]
+        if live_deals:
+            effective_stage = max(live_deals, key=lambda d: STAGE_RANK.get(d["stage"], 0))["stage"]
+        else:
+            effective_stage = "lost"
+        pipeline[effective_stage].append(card)
 
     return pipeline
 
